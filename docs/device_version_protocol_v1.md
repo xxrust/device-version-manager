@@ -59,9 +59,10 @@
 ### device
 
 - `device.id` (string, MUST)：设备唯一 ID（推荐用序列号/出厂唯一编码）
-- `device.vendor` (string, MUST)：供应商名（稳定值）
-- `device.model` (string, MUST)：型号/机型（稳定值）
+- `device.supplier` (string, MUST)：供应商名（稳定值）
+- `device.device_type` (string, MUST)：设备型号（稳定值）
 - `device.serial` (string, SHOULD)：序列号（可与 id 相同）
+
 
 ### versions
 
@@ -91,7 +92,7 @@
   "protocol": "dvp",
   "protocol_version": 1,
   "timestamp": "2025-12-17T08:40:10Z",
-  "device": { "id": "VISION-001", "vendor": "VendorX", "model": "VisionStation-3", "serial": "VS3-24001" },
+  "device": { "id": "VISION-001", "supplier": "VendorX", "device_type": "VisionStation-3", "serial": "VS3-24001" },
   "versions": { "main": "1.8.2", "firmware": "F3.2.0" },
   "components": [
     { "name": "vision-algo", "version": "2.4.1", "checksum": "sha256:..." },
@@ -106,4 +107,3 @@
 - 管理器以 `protocol` + `protocol_version` 判断解析器
 - v1 只保证上述 MUST 字段；供应商可自定义字段，管理器会保留原始 JSON 以便追溯
 - 如需扩展鉴权/签名：建议在 v2 引入 `signing` 字段与 mTLS 支持
-

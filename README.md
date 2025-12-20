@@ -2,6 +2,12 @@
 
 目标：统一管理工厂局域网内各设备/设备集群的软件与固件版本；自动从设备拉取版本；建立“供应商接入标准”；提供版本基线（Baseline）与不一致告警，减少因版本不统一导致的不良品流出。
 
+## Dashboard 能做什么
+
+- 设备状态总览：`ok / mismatch / offline / no_baseline / never_polled`
+- 一键设为基线：在“设备状态”表格中可将某台设备的“当前版本”快速设置为该 `集群 + 供应商 + 设备型号` 的基线
+- 筛选与搜索：支持按状态筛选、关键字搜索（序列号/IP/产线/供应商/型号/版本），KPI 卡片也可点击快速筛选
+
 ## 你真正需要的东西（第一性原理）
 
 - **真实版本数据必须来自设备本体**：版本以“拉取（pull）”为准，而不是人工录入。
@@ -31,7 +37,7 @@
 1) 初始化并启动服务：
 
 ```powershell
-cd E:\personal_project\version_manage
+cd version_manage
 python -m src.version_manager.server --host 0.0.0.0 --port 8080 --db .\data\vm.sqlite3 --default-cluster-name "新集群1" --poll-interval 30 --registration-token "change-me"
 ```
 
@@ -57,9 +63,9 @@ irm -Method Post http://localhost:8080/api/v1/clusters -ContentType application/
 ```powershell
 irm -Method Post http://localhost:8080/api/v1/devices -ContentType application/json -Body '{
   "cluster_id": 1,
-  "device_key": "VISION-001",
-  "vendor": "VendorX",
-  "model": "VisionStation-3",
+  "device_serial": "VISION-001",
+  "supplier": "VendorX",
+  "device_type": "VisionStation-3",
   "line_no": "Line-01",
   "ip": "192.168.10.21",
   "port": 80,
@@ -78,9 +84,9 @@ irm -Method Post http://localhost:8080/api/v1/register `
   -ContentType application/json `
   -Body '{
     "cluster": { "name": "产线A-视觉站" },
-    "device_key": "VISION-001",
-    "vendor": "VendorX",
-    "model": "VisionStation-3",
+    "device_serial": "VISION-001",
+    "supplier": "VendorX",
+    "device_type": "VisionStation-3",
     "prefer_remote_ip": true,
     "port": 80,
     "path": "/.well-known/device-version",
@@ -98,13 +104,13 @@ irm -Method Post http://localhost:8080/api/v1/discover -ContentType application/
 }'
 ```
 
-3) 设置基线（集群 + vendor + model 维度）
+3) 设置基线（集群 + 供应商 + 设备型号 维度）
 
 ```powershell
 irm -Method Post http://localhost:8080/api/v1/baselines -ContentType application/json -Body '{
   "cluster_id": 1,
-  "vendor": "VendorX",
-  "model": "VisionStation-3",
+  "supplier": "VendorX",
+  "device_type": "VisionStation-3",
   "expected_main_version": "1.8.2",
   "note": "产线A-视觉站统一到 1.8.2"
 }'

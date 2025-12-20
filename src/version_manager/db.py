@@ -624,6 +624,30 @@ class Database:
             )
             return int(cur.lastrowid) if cur.lastrowid else 0
 
+    def ensure_version_catalog_entry(self, *, vendor: str, model: str, main_version: str) -> None:
+        now = _utc_now_iso()
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO version_catalog(vendor, model, main_version, created_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(vendor, model, main_version) DO NOTHING
+                """,
+                (vendor, model, main_version, now),
+            )
+
+    def get_version_catalog_item(self, *, vendor: str, model: str, main_version: str) -> Optional[Dict[str, Any]]:
+        rows = self._query(
+            """
+            SELECT id, vendor, model, main_version, changelog_md, released_at, risk_level, checksum, created_at
+            FROM version_catalog
+            WHERE vendor = ? AND model = ? AND main_version = ?
+            LIMIT 1
+            """,
+            (vendor, model, main_version),
+        )
+        return dict(rows[0]) if rows else None
+
     def list_version_catalog(self, *, vendor: Optional[str] = None, model: Optional[str] = None) -> List[Dict[str, Any]]:
         wheres: List[str] = []
         params: List[Any] = []
@@ -703,6 +727,94 @@ class Database:
         else:
             d["payload"] = None
         return d
+
+    def get_latest_success_snapshot(self, device_id: int) -> Optional[Dict[str, Any]]:
+        rows = self._query(
+            """
+            SELECT id, device_id, observed_at, success, http_status, latency_ms, error,
+                   protocol_version, main_version, firmware_version, payload_json
+            FROM device_snapshots
+            WHERE device_id = ? AND success = 1
+            ORDER BY observed_at DESC, id DESC
+            LIMIT 1
+            """,
+            (device_id,),
+        )
+        if not rows:
+            return None
+        d = dict(rows[0])
+        if d.get("payload_json"):
+            try:
+                d["payload"] = json.loads(d["payload_json"])
+            except json.JSONDecodeError:
+                d["payload"] = None
+        else:
+            d["payload"] = None
+        return d
+
+    def list_device_snapshots(
+        self, *, device_id: int, limit: int = 50, offset: int = 0, success_only: bool = False
+    ) -> List[Dict[str, Any]]:
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+        where = "WHERE device_id = ?"
+        params: List[Any] = [int(device_id)]
+        if success_only:
+            where += " AND success = 1"
+        rows = self._query(
+            f"""
+            SELECT id, device_id, observed_at, success, http_status, latency_ms, error,
+                   protocol_version, main_version, firmware_version, payload_json
+            FROM device_snapshots
+            {where}
+            ORDER BY observed_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params + [limit, offset]),
+        )
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            if d.get("payload_json"):
+                try:
+                    d["payload"] = json.loads(d["payload_json"])
+                except json.JSONDecodeError:
+                    d["payload"] = None
+            else:
+                d["payload"] = None
+            out.append(d)
+        return out
+
+    def list_device_version_history(self, *, device_id: int, limit: int = 200) -> List[Dict[str, Any]]:
+        limit = max(1, min(int(limit), 500))
+        rows = self._query(
+            """
+            SELECT
+                s.main_version AS main_version,
+                MIN(s.observed_at) AS first_seen,
+                MAX(s.observed_at) AS last_seen,
+                COUNT(*) AS samples,
+                vc.changelog_md AS changelog_md,
+                vc.released_at AS released_at,
+                vc.risk_level AS risk_level,
+                vc.checksum AS checksum
+            FROM device_snapshots s
+            JOIN devices d ON d.id = s.device_id
+            LEFT JOIN version_catalog vc
+                ON vc.vendor = d.vendor AND vc.model = d.model AND vc.main_version = s.main_version
+            WHERE s.device_id = ? AND s.success = 1 AND s.main_version IS NOT NULL AND s.main_version != ''
+            GROUP BY s.main_version
+            ORDER BY last_seen DESC
+            LIMIT ?
+            """,
+            (int(device_id), limit),
+        )
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            d["samples"] = int(d.get("samples") or 0)
+            out.append(d)
+        return out
 
     def list_status(self) -> List[Dict[str, Any]]:
         devices = self.list_devices()

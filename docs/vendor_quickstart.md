@@ -15,7 +15,7 @@
 {
   "protocol": "dvp",
   "protocol_version": 1,
-  "device": { "id": "PLC-07", "vendor": "VendorY", "model": "PLC-Pro" },
+  "device": { "id": "PLC-07", "supplier": "VendorY", "device_type": "PLC-Pro" },
   "versions": { "main": "3.1.0" }
 }
 ```
@@ -34,4 +34,3 @@
 - Token 可由设备端配置页面写入
 
 版本管理器会在设备注册时保存 token，并在拉取时带上请求头。
-

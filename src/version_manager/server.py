@@ -34,6 +34,46 @@ def _read_json(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
         raise ValueError(f"invalid_json:{e}") from e
 
 
+def _get_body_str(body: Dict[str, Any], *keys: str) -> str:
+    for k in keys:
+        v = body.get(k)
+        if v is None:
+            continue
+        if isinstance(v, (str, int, float, bool)):
+            s = str(v).strip()
+            if s:
+                return s
+    return ""
+
+
+def _present_device(d: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not d:
+        return d
+    out = dict(d)
+    out["device_serial"] = out.pop("device_key", None)
+    out["supplier"] = out.pop("vendor", None)
+    out["device_type"] = out.pop("model", None)
+    return out
+
+
+def _present_baseline(d: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not d:
+        return d
+    out = dict(d)
+    out["supplier"] = out.pop("vendor", None)
+    out["device_type"] = out.pop("model", None)
+    return out
+
+
+def _present_version_catalog_item(d: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not d:
+        return d
+    out = dict(d)
+    out["supplier"] = out.pop("vendor", None)
+    out["device_type"] = out.pop("model", None)
+    return out
+
+
 def _send_json(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> None:
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     handler.send_response(status)
@@ -97,14 +137,19 @@ def _infer_from_dvp(payload: Dict[str, Any]) -> Dict[str, str]:
     out: Dict[str, str] = {}
     if isinstance(device_obj, dict):
         did = device_obj.get("id")
-        if isinstance(did, str) and did.strip():
-            out["device_id"] = did.strip()
-        vendor = device_obj.get("vendor")
-        if isinstance(vendor, str) and vendor.strip():
-            out["vendor"] = vendor.strip()
-        model = device_obj.get("model")
-        if isinstance(model, str) and model.strip():
-            out["model"] = model.strip()
+        serial = device_obj.get("serial")
+        if isinstance(serial, str) and serial.strip():
+            out["device_serial"] = serial.strip()
+        elif isinstance(did, str) and did.strip():
+            out["device_serial"] = did.strip()
+
+        supplier = device_obj.get("supplier")
+        if isinstance(supplier, str) and supplier.strip():
+            out["supplier"] = supplier.strip()
+
+        device_type = device_obj.get("device_type")
+        if isinstance(device_type, str) and device_type.strip():
+            out["device_type"] = device_type.strip()
     return out
 
 
@@ -211,7 +256,8 @@ def _dashboard_html() -> str:
     .small{ font-size:12px; color: var(--muted); }
     .muted{ color: var(--muted); }
     .kpi{ display:flex; gap:10px; flex-wrap:wrap; }
-    .kpi .box{ padding:10px 12px; border:1px solid var(--border); border-radius:12px; background: var(--surface2); }
+    .kpi .box{ padding:10px 12px; border:1px solid var(--border); border-radius:12px; background: var(--surface2); cursor:pointer; user-select:none; }
+    .kpi .box.active{ border-color: rgba(59,130,246,.35); box-shadow: 0 0 0 6px rgba(59,130,246,.12); }
     .kpi .n{ font-size:18px; font-weight:700; }
     .kpi .l{ font-size:12px; color: var(--muted); }
     dialog{
@@ -252,14 +298,27 @@ def _dashboard_html() -> str:
         </div>
         <div class="bd">
           <div class="kpi" id="kpi"></div>
+          <div class="row" style="margin-top:10px;">
+            <select id="filterState" style="width:160px;">
+              <option value="">全部状态</option>
+              <option value="ok">ok</option>
+              <option value="mismatch">mismatch</option>
+              <option value="offline">offline</option>
+              <option value="no_baseline">no_baseline</option>
+              <option value="never_polled">never_polled</option>
+              <option value="unknown">unknown</option>
+            </select>
+            <input id="filterQuery" placeholder="搜索：序列号/IP/产线/供应商/型号/版本" style="flex:1; min-width:240px; width:auto;" />
+            <button class="btn ghost" id="clearFilters">清除</button>
+          </div>
+          <div class="small muted" id="filterInfo" style="margin-top:6px;"></div>
           <div class="scroll-x" style="margin-top:10px;">
             <table class="device-table">
               <thead>
                 <tr>
                   <th>ID</th>
-                  <th>DeviceKey</th>
+                  <th>设备序列号</th>
                   <th>产线号</th>
-                  <th>IP</th>
                   <th>状态</th>
                   <th>基线</th>
                   <th>当前</th>
@@ -311,7 +370,7 @@ def _dashboard_html() -> str:
             <div class="row" style="justify-content:space-between;">
               <div>
                 <div style="font-weight:700; margin-bottom:4px;">基线</div>
-                <div class="small muted">按 cluster + vendor + model 管理，可设置允许范围（如 1.8.*）。</div>
+                <div class="small muted">按 集群 + 供应商 + 设备型号 管理，可设置允许范围（如 1.8.*）。</div>
               </div>
               <button class="btn" id="addBaselineBtn">新增/修改</button>
             </div>
@@ -320,7 +379,7 @@ def _dashboard_html() -> str:
                 <thead>
                   <tr>
                     <th>ID</th>
-                    <th>Vendor/Model</th>
+                    <th>供应商/设备型号</th>
                     <th>期望</th>
                     <th>允许范围</th>
                     <th>备注</th>
@@ -368,11 +427,11 @@ def _dashboard_html() -> str:
         <select id="baselineCluster"></select>
       </div>
       <div class="field">
-        <label class="small">Vendor</label>
+        <label class="small">供应商</label>
         <input id="baselineVendor" placeholder="VendorX" />
       </div>
       <div class="field">
-        <label class="small">Model</label>
+        <label class="small">设备型号</label>
         <input id="baselineModel" placeholder="VisionStation-3" />
       </div>
       <div class="field">
@@ -420,7 +479,7 @@ def _dashboard_html() -> str:
       </div>
       <div style="height:10px;"></div>
       <div class="field">
-        <label class="small">Vendor / Model</label>
+        <label class="small">供应商 / 设备型号</label>
         <div class="pill" id="dVendorModel"></div>
       </div>
       <div class="field">
@@ -439,6 +498,38 @@ def _dashboard_html() -> str:
         <label class="small">错误</label>
         <div class="pill" id="dErr"></div>
       </div>
+      <details open>
+        <summary class="small">版本历史 / 更新内容</summary>
+        <div style="height:8px;"></div>
+        <div class="field">
+          <label class="small">历史版本</label>
+          <div style="overflow:auto; max-height:180px; border:1px solid var(--border); border-radius:12px; background: var(--surface2);">
+            <table>
+              <thead>
+                <tr>
+                  <th>版本</th>
+                  <th>最后出现</th>
+                  <th>次数</th>
+                  <th>更新内容</th>
+                </tr>
+              </thead>
+              <tbody id="dHistRows"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="field">
+          <label class="small">选择版本</label>
+          <select id="dCatalogVersion"></select>
+        </div>
+        <div class="field">
+          <label class="small">更新内容（Markdown）</label>
+          <textarea id="dChangelogMd" class="mono" rows="8" style="width:100%; padding:10px; border-radius:12px; border:1px solid var(--border); background: rgba(255,255,255,.95);"></textarea>
+        </div>
+        <div class="row">
+          <button class="btn" id="dSaveChangelog">保存更新内容</button>
+          <span class="small muted" id="dChangelogOut"></span>
+        </div>
+      </details>
       <details>
         <summary class="small">原始返回 JSON</summary>
         <pre class="mono" id="dRaw" style="white-space:pre-wrap; border:1px solid var(--border); border-radius:12px; padding:10px; background: var(--surface2);"></pre>
@@ -463,6 +554,65 @@ const esc = (s) => String(s ?? "")
   .replaceAll('"', "&quot;")
   .replaceAll("'", "&#39;");
 let currentDetailId = null;
+let currentDetailSupplier = null;
+let currentDetailDeviceType = null;
+let currentVersionHistory = [];
+let currentObservedCatalog = null;
+let statusItems = [];
+let statusById = {};
+let filterState = "";
+let filterQuery = "";
+
+function setChangelogEditor(version){
+  const sel = document.getElementById("dCatalogVersion");
+  if(version){ sel.value = version; }
+  const v = sel.value;
+  const item = currentVersionHistory.find(x => String(x.main_version||"") === String(v||"")) || null;
+  const md = (currentObservedCatalog && String(currentObservedCatalog.main_version||"") === String(v||""))
+    ? (currentObservedCatalog.changelog_md || "")
+    : ((item && item.changelog_md) ? item.changelog_md : "");
+  document.getElementById("dChangelogMd").value = md || "";
+}
+
+function renderVersionHistory(items){
+  const tbody = document.getElementById("dHistRows");
+  tbody.innerHTML = "";
+  for(const it of items){
+    const ver = String(it.main_version || "");
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td class="mono">${esc(ver)}</td>
+      <td class="mono">${esc(fmt(it.last_seen))}</td>
+      <td class="mono">${esc(fmt(it.samples))}</td>
+      <td>${it.changelog_md ? "✅" : "—"}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+}
+
+async function loadDeviceVersionHistory(deviceId, observedVersion){
+  document.getElementById("dChangelogOut").textContent = "";
+  const sel = document.getElementById("dCatalogVersion");
+  sel.innerHTML = "";
+  document.getElementById("dHistRows").innerHTML = "";
+  currentVersionHistory = [];
+
+  const res = await apiFetch(`/api/v1/devices/${deviceId}/version-history?limit=200`);
+  const data = await res.json();
+  const items = (data.items || []).filter(x => x && x.main_version);
+  currentVersionHistory = items;
+  renderVersionHistory(items);
+
+  const versions = items.map(x => String(x.main_version || "")).filter(Boolean);
+  if(observedVersion && !versions.includes(observedVersion)){ versions.unshift(observedVersion); }
+  for(const v of versions){
+    const opt = document.createElement("option");
+    opt.value = v;
+    opt.textContent = v;
+    sel.appendChild(opt);
+  }
+  setChangelogEditor(observedVersion || (versions[0] || ""));
+}
 async function apiFetch(url, opts){
   const res = await fetch(url, opts);
   if(res.status === 401){
@@ -475,47 +625,100 @@ async function load() {
   await loadClusters();
   const res = await apiFetch("/api/v1/status");
   const data = await res.json();
-  const tbody = document.getElementById("rows");
-  tbody.innerHTML = "";
-  let counts = {};
-  for (const row of data.items) {
-    counts[row.state] = (counts[row.state] || 0) + 1;
-    const dev = row.device;
-    const base = row.baseline;
-    const snap = row.latest_snapshot;
-    const expected = base ? base.expected_main_version : "";
-    const observed = snap ? (snap.main_version || "") : "";
-    const err = snap ? (snap.error || "") : "";
-    const tr = document.createElement("tr");
-    tr.className = row.state;
-    tr.innerHTML = `
-      <td class="mono">${esc(dev.id)}</td>
-      <td>${esc(fmt(dev.device_key))}</td>
-      <td class="mono">${esc(fmt(dev.line_no || ""))}</td>
-      <td class="mono">${esc(fmt(dev.ip))}:${esc(fmt(dev.port))}</td>
-      <td>${badge(row.state)}</td>
-      <td class="mono">${esc(expected)}</td>
-      <td class="mono">${esc(observed)}</td>
-      <td class="err" title="${esc(err)}">${esc(fmt(err))}</td>
-      <td>
-        <button class="btn ghost" data-act="detail" data-id="${dev.id}">详情</button>
-        <button class="btn ghost" data-act="toggle" data-id="${dev.id}" data-enabled="${dev.enabled}">${dev.enabled ? "停用" : "启用"}</button>
-        <button class="btn danger" data-act="delete" data-id="${dev.id}">删除</button>
-      </td>
-    `;
-    tbody.appendChild(tr);
-  }
-  const parts = Object.entries(counts).map(([k,v]) => `${k}:${v}`).join("  ");
-  renderKpi(counts);
+  statusItems = Array.isArray(data.items) ? data.items : [];
+  renderStatusTable();
   document.getElementById("lastUpdate").textContent = new Date().toISOString();
   await loadEvents();
   await loadBaselines();
   await loadMe();
 }
 
+function updateFilterInfo(filtered, total){
+  const el = document.getElementById("filterInfo");
+  if(!el) return;
+  if(filtered === total){
+    el.textContent = `显示 ${total} 台设备`;
+  }else{
+    el.textContent = `筛选后显示 ${filtered}/${total} 台设备`;
+  }
+}
+
+function renderStatusTable(){
+  const stateSel = document.getElementById("filterState");
+  const queryEl = document.getElementById("filterQuery");
+  filterState = stateSel ? String(stateSel.value || "") : "";
+  filterQuery = queryEl ? String(queryEl.value || "").trim().toLowerCase() : "";
+
+  statusById = {};
+  const tbody = document.getElementById("rows");
+  tbody.innerHTML = "";
+
+  let counts = {};
+  let filtered = 0;
+  for (const row of statusItems) {
+    counts[row.state] = (counts[row.state] || 0) + 1;
+    const dev = row.device || {};
+    statusById[String(dev.id)] = row;
+  }
+  renderKpi(counts);
+
+  const q = filterQuery;
+  const matchesQuery = (row) => {
+    if(!q) return true;
+    const dev = row.device || {};
+    const snap = row.latest_snapshot || null;
+    const base = row.baseline || null;
+    const parts = [
+      dev.id,
+      dev.device_serial,
+      dev.line_no,
+      dev.ip,
+      dev.supplier,
+      dev.device_type,
+      base ? base.expected_main_version : "",
+      snap ? snap.main_version : "",
+      row.state,
+    ].map(x => String(x || "").toLowerCase());
+    return parts.some(x => x.includes(q));
+  };
+
+  const matchesState = (row) => !filterState || String(row.state || "") === filterState;
+
+  for (const row of statusItems) {
+    if(!matchesState(row) || !matchesQuery(row)) continue;
+    filtered += 1;
+    const dev = row.device || {};
+    const base = row.baseline || null;
+    const snap = row.latest_snapshot || null;
+    const expected = base ? base.expected_main_version : "";
+    const observed = snap ? (snap.main_version || "") : "";
+    const err = snap ? (snap.error || "") : "";
+    const canSetBaseline = Boolean(observed) && !["offline","never_polled","unknown"].includes(String(row.state || ""));
+    const tr = document.createElement("tr");
+    tr.className = row.state;
+    tr.innerHTML = `
+      <td class="mono">${esc(dev.id)}</td>
+      <td>${esc(fmt(dev.device_serial))}</td>
+      <td class="mono">${esc(fmt(dev.line_no || ""))}</td>
+      <td>${badge(row.state)}</td>
+      <td class="mono">${esc(expected)}</td>
+      <td class="mono">${esc(observed)}</td>
+      <td class="err" title="${esc(err)}">${esc(fmt(err))}</td>
+      <td>
+        <button class="btn ghost" data-act="detail" data-id="${dev.id}">详情</button>
+        <button class="btn ghost" data-act="set_baseline" data-id="${dev.id}" ${canSetBaseline ? "" : "disabled"}>设为基线</button>
+        <button class="btn ghost" data-act="toggle" data-id="${dev.id}" data-enabled="${dev.enabled}">${dev.enabled ? "停用" : "启用"}</button>
+        <button class="btn danger" data-act="delete" data-id="${dev.id}">删除</button>
+      </td>
+    `;
+    tbody.appendChild(tr);
+  }
+  updateFilterInfo(filtered, statusItems.length);
+}
+
 function renderKpi(counts){
   const el = document.getElementById("kpi");
-  const mk = (label, value) => `<div class="box"><div class="n">${value||0}</div><div class="l">${label}</div></div>`;
+  const mk = (label, value) => `<div class="box ${filterState === label ? "active" : ""}" data-state="${label}"><div class="n">${value||0}</div><div class="l">${label}</div></div>`;
   el.innerHTML = [
     mk("ok", counts.ok),
     mk("mismatch", counts.mismatch),
@@ -535,6 +738,29 @@ async function loadMe(){
   }catch{
     document.getElementById("who").textContent = "未登录";
   }
+}
+
+async function setBaselineFromDevice(deviceId){
+  const row = statusById[String(deviceId)] || null;
+  if(!row){ alert("not_found"); return; }
+  const dev = row.device || {};
+  const snap = row.latest_snapshot || null;
+  const observed = snap ? String(snap.main_version || "").trim() : "";
+  if(!observed){ alert("no_observed_version"); return; }
+  const cluster_id = Number(dev.cluster_id || 0);
+  const supplier = String(dev.supplier || "").trim();
+  const device_type = String(dev.device_type || "").trim();
+  if(!cluster_id || !supplier || !device_type){ alert("missing_fields"); return; }
+  if(!confirm(`将 ${supplier}/${device_type} 的基线设置为 ${observed}？`)) return;
+  const note = `from device ${dev.device_serial || dev.id} at ${new Date().toISOString()}`;
+  const res = await apiFetch("/api/v1/baselines", {
+    method:"POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({cluster_id, supplier, device_type, expected_main_version: observed, note}),
+  });
+  const data = await res.json();
+  if(!res.ok){ alert(data.error || "设置失败"); return; }
+  alert("ok");
 }
 
 async function loadEvents() {
@@ -570,8 +796,15 @@ async function deleteDevice(id) {
 
 async function openDeviceDlg(id){
   currentDetailId = id;
+  currentDetailSupplier = null;
+  currentDetailDeviceType = null;
+  currentObservedCatalog = null;
   document.getElementById("dOut").textContent = "";
   document.getElementById("dRaw").textContent = "";
+  document.getElementById("dChangelogMd").value = "";
+  document.getElementById("dChangelogOut").textContent = "";
+  document.getElementById("dHistRows").innerHTML = "";
+  document.getElementById("dCatalogVersion").innerHTML = "";
   const dlg = document.getElementById("deviceDlg");
   dlg.showModal();
   const res = await apiFetch(`/api/v1/devices/${id}`);
@@ -579,14 +812,17 @@ async function openDeviceDlg(id){
   const dev = data.device || {};
   const base = data.baseline || null;
   const snap = data.latest_snapshot || null;
-  document.getElementById("dTitle").textContent = `${dev.device_key || ""} (#${dev.id || ""})`;
+  currentObservedCatalog = data.observed_version_catalog || null;
+  currentDetailSupplier = dev.supplier || "";
+  currentDetailDeviceType = dev.device_type || "";
+  document.getElementById("dTitle").textContent = `${dev.device_serial || ""} (#${dev.id || ""})`;
   document.getElementById("dSub").textContent = `集群 ${dev.cluster_id || ""}`;
   document.getElementById("dState").textContent = dev.last_state || "unknown";
   document.getElementById("dLineNo").value = dev.line_no || "";
   document.getElementById("dIp").textContent = `${dev.ip || ""}:${dev.port || ""}`;
   document.getElementById("dProto").textContent = dev.protocol || "";
   document.getElementById("dPath").textContent = dev.path || "";
-  document.getElementById("dVendorModel").textContent = `${dev.vendor || ""} / ${dev.model || ""}`;
+  document.getElementById("dVendorModel").textContent = `${dev.supplier || ""} / ${dev.device_type || ""}`;
   document.getElementById("dObservedAt").textContent = snap ? (snap.observed_at || "") : "";
   const expected = base ? (base.expected_main_version || "") : "";
   const globs = base ? ((base.allowed_main_globs || []).join(", ")) : "";
@@ -595,6 +831,31 @@ async function openDeviceDlg(id){
   document.getElementById("dErr").textContent = snap ? (snap.error || "") : "";
   const raw = snap && snap.payload ? snap.payload : null;
   document.getElementById("dRaw").textContent = raw ? JSON.stringify(raw, null, 2) : "";
+  await loadDeviceVersionHistory(id, snap ? (snap.main_version || "") : "");
+}
+
+async function saveChangelog(){
+  const out = document.getElementById("dChangelogOut");
+  out.textContent = "";
+  const deviceId = currentDetailId;
+  const supplier = String(currentDetailSupplier || "").trim();
+  const device_type = String(currentDetailDeviceType || "").trim();
+  const main_version = String(document.getElementById("dCatalogVersion").value || "").trim();
+  const mdRaw = document.getElementById("dChangelogMd").value;
+  const changelog_md = (mdRaw && mdRaw.trim()) ? mdRaw : null;
+  if(!deviceId || !supplier || !device_type || !main_version){
+    out.textContent = "missing_fields";
+    return;
+  }
+  const res = await apiFetch("/api/v1/version-catalog", {
+    method:"POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({supplier, device_type, main_version, changelog_md}),
+  });
+  const data = await res.json();
+  if(!res.ok){ out.textContent = data.error || "保存失败"; return; }
+  out.textContent = "ok";
+  await loadDeviceVersionHistory(deviceId, main_version);
 }
 
 async function saveDeviceDetail(){
@@ -682,7 +943,7 @@ async function loadBaselines(){
     tr.setAttribute("data-baseline", JSON.stringify(b));
     tr.innerHTML = `
       <td class="mono">${b.id}</td>
-      <td>${fmt(b.vendor)}/${fmt(b.model)}</td>
+      <td>${fmt(b.supplier)}/${fmt(b.device_type)}</td>
       <td class="mono">${fmt(b.expected_main_version)}</td>
       <td class="mono">${fmt(globs)}</td>
       <td>${fmt(b.note)}</td>
@@ -694,8 +955,8 @@ async function loadBaselines(){
 function openBaselineDlg(b){
   document.getElementById("baselineDlgOut").textContent = "";
   document.getElementById("baselineCluster").value = document.getElementById("clusterSelect").value;
-  document.getElementById("baselineVendor").value = b ? (b.vendor || "") : "";
-  document.getElementById("baselineModel").value = b ? (b.model || "") : "";
+  document.getElementById("baselineVendor").value = b ? (b.supplier || "") : "";
+  document.getElementById("baselineModel").value = b ? (b.device_type || "") : "";
   document.getElementById("baselineExpected").value = b ? (b.expected_main_version || "") : "";
   document.getElementById("baselineGlobs").value = b ? ((b.allowed_main_globs || []).join(", ")) : "";
   document.getElementById("baselineNote").value = b ? (b.note || "") : "";
@@ -705,13 +966,13 @@ function openBaselineDlg(b){
 async function saveBaseline(){
   const out = document.getElementById("baselineDlgOut");
   const cluster_id = Number(document.getElementById("baselineCluster").value || "0");
-  const vendor = document.getElementById("baselineVendor").value.trim();
-  const model = document.getElementById("baselineModel").value.trim();
+  const supplier = document.getElementById("baselineVendor").value.trim();
+  const device_type = document.getElementById("baselineModel").value.trim();
   const expected_main_version = document.getElementById("baselineExpected").value.trim();
   const globsRaw = document.getElementById("baselineGlobs").value.trim();
   const note = document.getElementById("baselineNote").value.trim();
   const allowed_main_globs = globsRaw ? globsRaw.split(",").map(s => s.trim()).filter(Boolean) : [];
-  const body = {cluster_id, vendor, model, expected_main_version, allowed_main_globs, note};
+  const body = {cluster_id, supplier, device_type, expected_main_version, allowed_main_globs, note};
   const res = await apiFetch("/api/v1/baselines", { method:"POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify(body) });
   const data = await res.json();
   if(!res.ok){ out.textContent = data.error || "保存失败"; return; }
@@ -745,6 +1006,23 @@ document.getElementById("logoutBtn").addEventListener("click", logout);
 document.getElementById("closeDeviceDlg").addEventListener("click", () => document.getElementById("deviceDlg").close());
 document.getElementById("deviceCancel").addEventListener("click", () => document.getElementById("deviceDlg").close());
 document.getElementById("deviceSave").addEventListener("click", saveDeviceDetail);
+document.getElementById("dCatalogVersion").addEventListener("change", () => setChangelogEditor());
+document.getElementById("dSaveChangelog").addEventListener("click", saveChangelog);
+document.getElementById("filterState").addEventListener("change", () => renderStatusTable());
+document.getElementById("filterQuery").addEventListener("input", () => renderStatusTable());
+document.getElementById("clearFilters").addEventListener("click", () => {
+  document.getElementById("filterState").value = "";
+  document.getElementById("filterQuery").value = "";
+  renderStatusTable();
+});
+document.getElementById("kpi").addEventListener("click", (ev) => {
+  const box = ev.target.closest(".box");
+  if(!box) return;
+  const st = box.getAttribute("data-state") || "";
+  const sel = document.getElementById("filterState");
+  sel.value = (sel.value === st) ? "" : st;
+  renderStatusTable();
+});
 document.getElementById("baselines").addEventListener("click", (ev) => {
   const tr = ev.target.closest("tr");
   if(!tr) return;
@@ -761,6 +1039,9 @@ document.getElementById("rows").addEventListener("click", async (ev) => {
   if (act === "detail") {
     btn.disabled = true;
     try { await openDeviceDlg(id); } finally { btn.disabled = false; }
+  } else if (act === "set_baseline") {
+    btn.disabled = true;
+    try { await setBaselineFromDevice(id); } finally { btn.disabled = false; await load(); }
   } else if (act === "toggle") {
     const enabled = btn.getAttribute("data-enabled") === "1";
     btn.disabled = true;
@@ -929,6 +1210,8 @@ class App:
 
     def poll_and_record(self, device: Dict[str, Any], *, timeout_s: float = 2.0) -> Dict[str, Any]:
         device_id = int(device["id"])
+        prev = self.db.get_latest_success_snapshot(device_id)
+        prev_main = (str(prev.get("main_version")) if prev and prev.get("main_version") is not None else None)
         started = time.perf_counter()
         res = poll_device(device, timeout_s=timeout_s)
         elapsed_ms = int((time.perf_counter() - started) * 1000)
@@ -944,6 +1227,15 @@ class App:
             firmware_version=res.firmware_version,
             payload=res.payload,
         )
+        if res.success and res.main_version:
+            try:
+                self.db.ensure_version_catalog_entry(
+                    vendor=str(device.get("vendor") or "").strip(),
+                    model=str(device.get("model") or "").strip(),
+                    main_version=str(res.main_version),
+                )
+            except Exception:
+                pass
         old_state = device.get("last_state")
         new_state, message = self._compute_state_and_message(device=device, poll_result=res)
         if new_state:
@@ -957,9 +1249,9 @@ class App:
                 message=message,
                 payload={
                     "device_id": device_id,
-                    "device_key": device.get("device_key"),
-                    "vendor": device.get("vendor"),
-                    "model": device.get("model"),
+                    "device_serial": device.get("device_key"),
+                    "supplier": device.get("vendor"),
+                    "device_type": device.get("model"),
                     "ip": device.get("ip"),
                     "port": device.get("port"),
                     "observed_main_version": res.main_version,
@@ -977,6 +1269,44 @@ class App:
                     "timestamp": _utc_now_iso(),
                 }
             )
+        if res.success and res.main_version:
+            new_main = str(res.main_version)
+            if prev_main != new_main:
+                event_type = "version_observed" if prev_main is None else "version_change"
+                cat = None
+                try:
+                    cat = self.db.get_version_catalog_item(
+                        vendor=str(device.get("vendor") or "").strip(),
+                        model=str(device.get("model") or "").strip(),
+                        main_version=new_main,
+                    )
+                except Exception:
+                    cat = None
+                event_id = self.db.create_event(
+                    device_id=device_id,
+                    event_type=event_type,
+                    old_state=prev_main,
+                    new_state=new_main,
+                    message=f"{event_type} {prev_main or ''} -> {new_main}".strip(),
+                    payload={
+                        "device_id": device_id,
+                        "device_serial": device.get("device_key"),
+                        "supplier": device.get("vendor"),
+                        "device_type": device.get("model"),
+                        "old_main_version": prev_main,
+                        "new_main_version": new_main,
+                        "version_catalog": cat,
+                    },
+                )
+                self._notify_webhook(
+                    {
+                        "event_id": event_id,
+                        "event_type": event_type,
+                        "old_main_version": prev_main,
+                        "new_main_version": new_main,
+                        "timestamp": _utc_now_iso(),
+                    }
+                )
         return {
             "device_id": device_id,
             "success": res.success,
@@ -1131,7 +1461,49 @@ class VersionManagerHandler(BaseHTTPRequestHandler):
                 return
             cluster_id = qs.get("cluster_id", [None])[0]
             enabled_only = (qs.get("enabled_only", ["0"])[0] or "0") in ("1", "true", "True")
-            items = self.app.db.list_devices(cluster_id=int(cluster_id) if cluster_id else None, enabled_only=enabled_only)
+            items = [
+                _present_device(x)
+                for x in self.app.db.list_devices(
+                    cluster_id=int(cluster_id) if cluster_id else None, enabled_only=enabled_only
+                )
+            ]
+            return _send_json(self, 200, {"items": items})
+
+        if parts[:3] == ["api", "v1", "devices"] and len(parts) == 5 and parts[4] == "snapshots":
+            if not self._require_login():
+                return
+            try:
+                device_id = int(parts[3])
+            except ValueError:
+                return _send_json(self, 400, {"error": "invalid_device_id"})
+            if not self.app.db.get_device(device_id):
+                return _send_json(self, 404, {"error": "not_found"})
+            limit = qs.get("limit", ["50"])[0]
+            offset = qs.get("offset", ["0"])[0]
+            success_only = (qs.get("success_only", ["0"])[0] or "0") in ("1", "true", "True")
+            try:
+                lim = int(limit) if limit else 50
+                off = int(offset) if offset else 0
+            except Exception:
+                lim, off = 50, 0
+            items = self.app.db.list_device_snapshots(device_id=device_id, limit=lim, offset=off, success_only=success_only)
+            return _send_json(self, 200, {"items": items})
+
+        if parts[:3] == ["api", "v1", "devices"] and len(parts) == 5 and parts[4] == "version-history":
+            if not self._require_login():
+                return
+            try:
+                device_id = int(parts[3])
+            except ValueError:
+                return _send_json(self, 400, {"error": "invalid_device_id"})
+            if not self.app.db.get_device(device_id):
+                return _send_json(self, 404, {"error": "not_found"})
+            limit = qs.get("limit", ["200"])[0]
+            try:
+                lim = int(limit) if limit else 200
+            except Exception:
+                lim = 200
+            items = self.app.db.list_device_version_history(device_id=device_id, limit=lim)
             return _send_json(self, 200, {"items": items})
 
         if parts[:3] == ["api", "v1", "devices"] and len(parts) == 4:
@@ -1146,21 +1518,52 @@ class VersionManagerHandler(BaseHTTPRequestHandler):
                 return _send_json(self, 404, {"error": "not_found"})
             snap = self.app.db.get_latest_snapshot(device_id)
             base = self.app.db.get_baseline(cluster_id=int(dev["cluster_id"]), vendor=str(dev["vendor"]), model=str(dev["model"]))
-            return _send_json(self, 200, {"device": dev, "baseline": base, "latest_snapshot": snap})
+            observed_catalog = None
+            expected_catalog = None
+            try:
+                vendor = str(dev.get("vendor") or "").strip()
+                model = str(dev.get("model") or "").strip()
+                if snap and snap.get("main_version"):
+                    observed_catalog = _present_version_catalog_item(
+                        self.app.db.get_version_catalog_item(vendor=vendor, model=model, main_version=str(snap["main_version"]))
+                    )
+                if base and base.get("expected_main_version"):
+                    expected_catalog = _present_version_catalog_item(
+                        self.app.db.get_version_catalog_item(
+                            vendor=vendor, model=model, main_version=str(base["expected_main_version"])
+                        )
+                    )
+            except Exception:
+                observed_catalog = None
+                expected_catalog = None
+            return _send_json(
+                self,
+                200,
+                {
+                    "device": _present_device(dev),
+                    "baseline": _present_baseline(base),
+                    "latest_snapshot": snap,
+                    "observed_version_catalog": observed_catalog,
+                    "expected_version_catalog": expected_catalog,
+                },
+            )
 
         if parts[:3] == ["api", "v1", "baselines"] and len(parts) == 3:
             if not self._require_login():
                 return
             cluster_id = qs.get("cluster_id", [None])[0]
-            items = self.app.db.list_baselines(cluster_id=int(cluster_id) if cluster_id else None)
+            items = [_present_baseline(x) for x in self.app.db.list_baselines(cluster_id=int(cluster_id) if cluster_id else None)]
             return _send_json(self, 200, {"items": items})
 
         if parts[:3] == ["api", "v1", "version-catalog"] and len(parts) == 3:
             if not self._require_login():
                 return
-            vendor = qs.get("vendor", [None])[0]
-            model = qs.get("model", [None])[0]
-            items = self.app.db.list_version_catalog(vendor=vendor, model=model)
+            supplier = qs.get("supplier", [None])[0]
+            device_type = qs.get("device_type", [None])[0]
+            items = [
+                _present_version_catalog_item(x)
+                for x in self.app.db.list_version_catalog(vendor=supplier, model=device_type)
+            ]
             return _send_json(self, 200, {"items": items})
 
         if parts[:3] == ["api", "v1", "events"] and len(parts) == 3:
@@ -1184,7 +1587,14 @@ class VersionManagerHandler(BaseHTTPRequestHandler):
         if parts[:3] == ["api", "v1", "status"] and len(parts) == 3:
             if not self._require_login():
                 return
-            return _send_json(self, 200, {"items": self.app.db.list_status(), "timestamp": _utc_now_iso()})
+            rows = self.app.db.list_status()
+            out: List[Dict[str, Any]] = []
+            for r in rows:
+                rr = dict(r)
+                rr["device"] = _present_device(rr.get("device"))
+                rr["baseline"] = _present_baseline(rr.get("baseline"))
+                out.append(rr)
+            return _send_json(self, 200, {"items": out, "timestamp": _utc_now_iso()})
 
         if parsed.path == "/api/v1/me":
             u = self._auth()
@@ -1295,9 +1705,9 @@ class VersionManagerHandler(BaseHTTPRequestHandler):
             if not self.app.db.get_cluster(int(cluster_id)):
                 return _send_json(self, 404, {"error": "cluster_not_found"})
 
-            device_key = str(body.get("device_key") or "").strip()
-            vendor = str(body.get("vendor") or "").strip()
-            model = str(body.get("model") or "").strip()
+            device_serial = _get_body_str(body, "device_serial").strip()
+            supplier = _get_body_str(body, "supplier").strip()
+            device_type = _get_body_str(body, "device_type").strip()
             device_key_prefix = str(body.get("device_key_prefix") or "").strip()
             line_no = body.get("line_no")
 
@@ -1329,7 +1739,7 @@ class VersionManagerHandler(BaseHTTPRequestHandler):
 
             pre_poll_payload: Optional[Dict[str, Any]] = None
             pre_poll_result: Optional[Dict[str, Any]] = None
-            if not device_key or not vendor or not model:
+            if not device_serial or not supplier or not device_type:
                 probe_dev = {
                     "ip": ip,
                     "port": port,
@@ -1349,20 +1759,20 @@ class VersionManagerHandler(BaseHTTPRequestHandler):
                 if res.success and isinstance(res.payload, dict):
                     pre_poll_payload = res.payload
                     inferred = _infer_from_dvp(res.payload)
-                    if not vendor and inferred.get("vendor"):
-                        vendor = inferred["vendor"]
-                    if not model and inferred.get("model"):
-                        model = inferred["model"]
-                    if not device_key and inferred.get("device_id"):
-                        device_key = device_key_prefix + inferred["device_id"]
+                    if not supplier and inferred.get("supplier"):
+                        supplier = inferred["supplier"]
+                    if not device_type and inferred.get("device_type"):
+                        device_type = inferred["device_type"]
+                    if not device_serial and inferred.get("device_serial"):
+                        device_serial = device_key_prefix + inferred["device_serial"]
 
-            if not device_key or not vendor or not model:
+            if not device_serial or not supplier or not device_type:
                 return _send_json(
                     self,
                     400,
                     {
                         "error": "missing_fields",
-                        "required": ["device_key", "vendor", "model"],
+                        "required": ["device_serial", "supplier", "device_type"],
                         "hint": "provide dvp_url (or ip/port/path) and let server infer fields, or provide fields directly",
                         "pre_poll": pre_poll_result,
                     },
@@ -1370,9 +1780,9 @@ class VersionManagerHandler(BaseHTTPRequestHandler):
 
             device_id, action = self.app.db.upsert_device_by_key(
                 cluster_id=int(cluster_id),
-                device_key=device_key,
-                vendor=vendor,
-                model=model,
+                device_key=device_serial,
+                vendor=supplier,
+                model=device_type,
                 line_no=str(line_no).strip() if line_no is not None else None,
                 ip=ip,
                 port=port,
@@ -1434,9 +1844,9 @@ class VersionManagerHandler(BaseHTTPRequestHandler):
                 return _send_json(self, 400, {"error": str(e)})
             try:
                 cluster_id = int(body.get("cluster_id"))
-                device_key = str(body.get("device_key") or "").strip()
-                vendor = str(body.get("vendor") or "").strip()
-                model = str(body.get("model") or "").strip()
+                device_serial = _get_body_str(body, "device_serial").strip()
+                supplier = _get_body_str(body, "supplier").strip()
+                device_type = _get_body_str(body, "device_type").strip()
                 line_no = body.get("line_no")
                 ip = str(body.get("ip") or "").strip()
                 port = int(body.get("port") or 80)
@@ -1448,14 +1858,14 @@ class VersionManagerHandler(BaseHTTPRequestHandler):
                 enabled = bool(body.get("enabled", True))
             except Exception as e:  # noqa: BLE001
                 return _send_json(self, 400, {"error": f"invalid_request:{e}"})
-            if not device_key or not vendor or not model or not ip:
+            if not device_serial or not supplier or not device_type or not ip:
                 return _send_json(self, 400, {"error": "missing_fields"})
             try:
                 device_id = self.app.db.create_device(
                     cluster_id=cluster_id,
-                    device_key=device_key,
-                    vendor=vendor,
-                    model=model,
+                    device_key=device_serial,
+                    vendor=supplier,
+                    model=device_type,
                     line_no=str(line_no).strip() if line_no is not None else None,
                     ip=ip,
                     port=port,
@@ -1477,20 +1887,20 @@ class VersionManagerHandler(BaseHTTPRequestHandler):
                 return _send_json(self, 400, {"error": str(e)})
             try:
                 cluster_id = int(body.get("cluster_id"))
-                vendor = str(body.get("vendor") or "").strip()
-                model = str(body.get("model") or "").strip()
+                supplier = _get_body_str(body, "supplier").strip()
+                device_type = _get_body_str(body, "device_type").strip()
                 expected_main_version = str(body.get("expected_main_version") or "").strip()
                 allowed_main_globs = body.get("allowed_main_globs")
                 note = body.get("note")
                 effective_from = body.get("effective_from")
             except Exception as e:  # noqa: BLE001
                 return _send_json(self, 400, {"error": f"invalid_request:{e}"})
-            if not vendor or not model or not expected_main_version:
+            if not supplier or not device_type or not expected_main_version:
                 return _send_json(self, 400, {"error": "missing_fields"})
             self.app.db.upsert_baseline(
                 cluster_id=cluster_id,
-                vendor=vendor,
-                model=model,
+                vendor=supplier,
+                model=device_type,
                 expected_main_version=expected_main_version,
                 allowed_main_globs=allowed_main_globs if isinstance(allowed_main_globs, list) else None,
                 note=note,
@@ -1506,16 +1916,16 @@ class VersionManagerHandler(BaseHTTPRequestHandler):
             except ValueError as e:
                 return _send_json(self, 400, {"error": str(e)})
             try:
-                vendor = str(body.get("vendor") or "").strip()
-                model = str(body.get("model") or "").strip()
+                supplier = _get_body_str(body, "supplier").strip()
+                device_type = _get_body_str(body, "device_type").strip()
                 main_version = str(body.get("main_version") or "").strip()
             except Exception as e:  # noqa: BLE001
                 return _send_json(self, 400, {"error": f"invalid_request:{e}"})
-            if not vendor or not model or not main_version:
+            if not supplier or not device_type or not main_version:
                 return _send_json(self, 400, {"error": "missing_fields"})
             self.app.db.upsert_version_catalog(
-                vendor=vendor,
-                model=model,
+                vendor=supplier,
+                model=device_type,
                 main_version=main_version,
                 changelog_md=body.get("changelog_md"),
                 released_at=body.get("released_at"),
@@ -1632,20 +2042,20 @@ class VersionManagerHandler(BaseHTTPRequestHandler):
                         continue
 
                     payload = res.payload
-                    device_obj = payload.get("device", {}) if isinstance(payload, dict) else {}
-                    vendor = str(device_obj.get("vendor") or "").strip()
-                    model = str(device_obj.get("model") or "").strip()
-                    device_id = str(device_obj.get("id") or "").strip()
-                    if not vendor or not model or not device_id:
+                    inferred = _infer_from_dvp(payload)
+                    supplier = str(inferred.get("supplier") or "").strip()
+                    device_type = str(inferred.get("device_type") or "").strip()
+                    device_id = str(inferred.get("device_serial") or "").strip()
+                    if not supplier or not device_type or not device_id:
                         discovered.append({"ip": ip2, "success": False, "error": "missing_device_fields"})
                         continue
 
-                    device_key = str(body.get("device_key_prefix") or "").strip() + device_id
+                    device_serial = str(body.get("device_key_prefix") or "").strip() + device_id
                     dev_id, action = self.app.db.upsert_device_by_key(
                         cluster_id=cluster_id,
-                        device_key=device_key,
-                        vendor=vendor,
-                        model=model,
+                        device_key=device_serial,
+                        vendor=supplier,
+                        model=device_type,
                         line_no=str(line_no).strip() if line_no is not None else None,
                         ip=ip2,
                         port=port,
@@ -1675,9 +2085,9 @@ class VersionManagerHandler(BaseHTTPRequestHandler):
                             "ip": ip2,
                             "success": True,
                             "device_id": dev_id,
-                            "device_key": device_key,
-                            "vendor": vendor,
-                            "model": model,
+                            "device_serial": device_serial,
+                            "supplier": supplier,
+                            "device_type": device_type,
                             "main_version": res.main_version,
                             "action": action,
                         }
@@ -1735,9 +2145,9 @@ class VersionManagerHandler(BaseHTTPRequestHandler):
             self.app.db.update_device(
                 device_id,
                 cluster_id=cluster_id,
-                device_key=body.get("device_key"),
-                vendor=body.get("vendor"),
-                model=body.get("model"),
+                device_key=body.get("device_serial"),
+                vendor=body.get("supplier"),
+                model=body.get("device_type"),
                 line_no=str(line_no).strip() if line_no is not None else None,
                 ip=body.get("ip"),
                 port=port,

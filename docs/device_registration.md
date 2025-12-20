@@ -20,8 +20,9 @@
 
 必填：
 
-- `device_key`：设备在管理系统中的唯一键（推荐与设备出厂唯一 ID 对齐）
-- `vendor`、`model`
+- `device_serial`：设备在管理系统中的唯一键（推荐与设备出厂唯一 ID/序列号对齐）
+- `supplier`：供应商
+- `device_type`：设备型号
 - `line_no`（可选）：产线号/工位号，用于现场分组展示与管理
 
 集群选择（三选一）：
@@ -45,9 +46,9 @@
 ```json
 {
   "cluster": { "name": "产线A-视觉站" },
-  "device_key": "VISION-001",
-  "vendor": "VendorX",
-  "model": "VisionStation-3",
+  "device_serial": "VISION-001",
+  "supplier": "VendorX",
+  "device_type": "VisionStation-3",
   "prefer_remote_ip": true,
   "port": 80,
   "path": "/.well-known/device-version",

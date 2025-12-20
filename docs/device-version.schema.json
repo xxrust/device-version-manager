@@ -9,11 +9,11 @@
     "timestamp": { "type": "string" },
     "device": {
       "type": "object",
-      "required": ["id", "vendor", "model"],
+      "required": ["id", "supplier", "device_type"],
       "properties": {
         "id": { "type": "string", "minLength": 1 },
-        "vendor": { "type": "string", "minLength": 1 },
-        "model": { "type": "string", "minLength": 1 },
+        "supplier": { "type": "string", "minLength": 1 },
+        "device_type": { "type": "string", "minLength": 1 },
         "serial": { "type": "string" }
       },
       "additionalProperties": true
@@ -54,4 +54,3 @@
   },
   "additionalProperties": true
 }
-
