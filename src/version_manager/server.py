@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import difflib
+import fnmatch
 import json
 import os
 import time
@@ -14,6 +17,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
+from urllib.parse import quote
 
 from .db import Database, DeviceAuth
 from .poller import poll_device
@@ -57,6 +61,15 @@ def _present_device(d: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
 
 
 def _present_baseline(d: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not d:
+        return d
+    out = dict(d)
+    out["supplier"] = out.pop("vendor", None)
+    out["device_type"] = out.pop("model", None)
+    return out
+
+
+def _present_controlled_file_rule(d: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not d:
         return d
     out = dict(d)
@@ -383,9 +396,34 @@ def _dashboard_html() -> str:
                     <th>期望</th>
                     <th>允许范围</th>
                     <th>备注</th>
-                  </tr>
+                 </tr>
                 </thead>
                 <tbody id="baselines"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="field">
+            <div class="row" style="justify-content:space-between;">
+              <div>
+                <div style="font-weight:700; margin-bottom:4px;">受控文件</div>
+                <div class="small muted">指定需要监控的配置/模板文件（glob）；设备在 DVP 响应里提供 files 校验值时，会与上次成功拉取对比并提示变更。</div>
+              </div>
+              <button class="btn" id="addCfrBtn">新增/修改</button>
+            </div>
+            <div style="overflow:auto; margin-top:10px;">
+              <table>
+                <thead>
+                  <tr>
+                    <th>ID</th>
+                    <th>供应商/设备型号</th>
+                    <th>受控文件</th>
+                    <th>模式</th>
+                    <th>最大内容</th>
+                    <th>备注</th>
+                  </tr>
+                </thead>
+                <tbody id="controlledRules"></tbody>
               </table>
             </div>
           </div>
@@ -451,6 +489,53 @@ def _dashboard_html() -> str:
     <div class="dlg-ft">
       <button class="btn ghost" id="baselineCancel">取消</button>
       <button class="btn" id="baselineSave">保存</button>
+    </div>
+  </dialog>
+
+  <dialog id="cfrDlg" data-cfr-id="">
+    <div class="dlg-hd">
+      <div style="font-weight:700;">新增/修改受控文件</div>
+      <button class="btn ghost" id="closeCfrDlg">关闭</button>
+    </div>
+    <div class="dlg-bd">
+      <div class="field">
+        <label class="small">集群</label>
+        <select id="cfrCluster"></select>
+      </div>
+      <div class="field">
+        <label class="small">供应商</label>
+        <input id="cfrVendor" placeholder="VendorX" />
+      </div>
+      <div class="field">
+        <label class="small">设备型号</label>
+        <input id="cfrModel" placeholder="VisionStation-3" />
+      </div>
+      <div class="field">
+        <label class="small">受控文件（逗号分隔，支持 glob，如 /etc/app/*.yml）</label>
+        <input id="cfrPaths" class="mono" placeholder="/etc/app/config.yml, /opt/app/templates/*.json" />
+      </div>
+      <div class="field">
+        <label class="small">内容获取模式</label>
+        <select id="cfrMode">
+          <option value="auto">auto（优先内联，没有则拉取）</option>
+          <option value="inline">inline（只用内联 content_b64）</option>
+          <option value="fetch">fetch（使用 file 端点拉取）</option>
+        </select>
+      </div>
+      <div class="field">
+        <label class="small">最大内容字节（0 表示不抓取内容）</label>
+        <input id="cfrMaxBytes" class="mono" placeholder="8192" />
+      </div>
+      <div class="field">
+        <label class="small">备注</label>
+        <input id="cfrNote" placeholder="软件配置/模板配置" />
+      </div>
+      <div class="small" id="cfrDlgOut"></div>
+    </div>
+    <div class="dlg-ft">
+      <button class="btn ghost" id="cfrCancel">取消</button>
+      <button class="btn ghost" id="cfrDelete" style="display:none;">删除</button>
+      <button class="btn" id="cfrSave">保存</button>
     </div>
   </dialog>
 
@@ -630,6 +715,7 @@ async function load() {
   document.getElementById("lastUpdate").textContent = new Date().toISOString();
   await loadEvents();
   await loadBaselines();
+  await loadControlledFileRules();
   await loadMe();
 }
 
@@ -874,11 +960,13 @@ async function saveDeviceDetail(){
 async function loadClusters() {
   const sel = document.getElementById("clusterSelect");
   const sel2 = document.getElementById("baselineCluster");
+  const sel3 = document.getElementById("cfrCluster");
   const res = await apiFetch("/api/v1/clusters");
   const data = await res.json();
   const current = sel.value;
   sel.innerHTML = "";
   sel2.innerHTML = "";
+  sel3.innerHTML = "";
   for (const c of data.items) {
     const opt = document.createElement("option");
     opt.value = String(c.id);
@@ -888,8 +976,13 @@ async function loadClusters() {
     opt2.value = String(c.id);
     opt2.textContent = `${c.id} - ${c.name}`;
     sel2.appendChild(opt2);
+    const opt3 = document.createElement("option");
+    opt3.value = String(c.id);
+    opt3.textContent = `${c.id} - ${c.name}`;
+    sel3.appendChild(opt3);
   }
   if (current) sel.value = current;
+  if (sel.value) { sel2.value = sel.value; sel3.value = sel.value; }
 }
 
 async function createCluster() {
@@ -952,6 +1045,76 @@ async function loadBaselines(){
   }
 }
 
+async function loadControlledFileRules(){
+  const tbody = document.getElementById("controlledRules");
+  const clusterId = document.getElementById("clusterSelect").value;
+  const res = await apiFetch(`/api/v1/controlled-file-rules?cluster_id=${encodeURIComponent(clusterId)}`);
+  const data = await res.json();
+  tbody.innerHTML = "";
+  for (const r of (data.items || [])) {
+    const paths = (r.paths || []).join(", ");
+    const mode = String(r.mode || "auto");
+    const maxBytes = (r.max_bytes === null || r.max_bytes === undefined) ? "" : String(r.max_bytes);
+    const tr = document.createElement("tr");
+    tr.setAttribute("data-cfr", JSON.stringify(r));
+    tr.innerHTML = `
+      <td class="mono">${r.id}</td>
+      <td>${fmt(r.supplier)}/${fmt(r.device_type)}</td>
+      <td class="mono">${fmt(paths)}</td>
+      <td class="mono">${fmt(mode)}</td>
+      <td class="mono">${fmt(maxBytes)}</td>
+      <td>${fmt(r.note)}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+}
+
+function openCfrDlg(r){
+  const dlg = document.getElementById("cfrDlg");
+  dlg.setAttribute("data-cfr-id", r ? String(r.id || "") : "");
+  document.getElementById("cfrDlgOut").textContent = "";
+  document.getElementById("cfrCluster").value = document.getElementById("clusterSelect").value;
+  document.getElementById("cfrVendor").value = r ? (r.supplier || "") : "";
+  document.getElementById("cfrModel").value = r ? (r.device_type || "") : "";
+  document.getElementById("cfrPaths").value = r ? ((r.paths || []).join(", ")) : "";
+  document.getElementById("cfrMode").value = r ? (r.mode || "auto") : "auto";
+  document.getElementById("cfrMaxBytes").value = r && r.max_bytes !== null && r.max_bytes !== undefined ? String(r.max_bytes) : "8192";
+  document.getElementById("cfrNote").value = r ? (r.note || "") : "";
+  const del = document.getElementById("cfrDelete");
+  del.style.display = r ? "" : "none";
+  dlg.showModal();
+}
+
+async function saveCfr(){
+  const out = document.getElementById("cfrDlgOut");
+  const cluster_id = Number(document.getElementById("cfrCluster").value || "0");
+  const supplier = document.getElementById("cfrVendor").value.trim();
+  const device_type = document.getElementById("cfrModel").value.trim();
+  const pathsRaw = document.getElementById("cfrPaths").value.trim();
+  const mode = String(document.getElementById("cfrMode").value || "auto");
+  const max_bytes = Number(document.getElementById("cfrMaxBytes").value || "8192");
+  const note = document.getElementById("cfrNote").value.trim();
+  const paths = pathsRaw ? pathsRaw.split(",").map(s => s.trim()).filter(Boolean) : [];
+  const body = {cluster_id, supplier, device_type, paths, mode, max_bytes, note};
+  const res = await apiFetch("/api/v1/controlled-file-rules", { method:"POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify(body) });
+  const data = await res.json();
+  if(!res.ok){ out.textContent = data.error || "淇濆瓨澶辫触"; return; }
+  document.getElementById("cfrDlg").close();
+  await load();
+}
+
+async function deleteCfr(){
+  const dlg = document.getElementById("cfrDlg");
+  const id = dlg.getAttribute("data-cfr-id") || "";
+  if(!id) return;
+  if(!confirm(`纭鍒犻櫎鍙? ${id}锛?`)) return;
+  const res = await apiFetch(`/api/v1/controlled-file-rules/${encodeURIComponent(id)}`, { method:"DELETE" });
+  const data = await res.json();
+  if(!res.ok){ document.getElementById("cfrDlgOut").textContent = data.error || "鍒犻櫎澶辫触"; return; }
+  dlg.close();
+  await load();
+}
+
 function openBaselineDlg(b){
   document.getElementById("baselineDlgOut").textContent = "";
   document.getElementById("baselineCluster").value = document.getElementById("clusterSelect").value;
@@ -999,9 +1162,14 @@ document.getElementById("createCluster").addEventListener("click", createCluster
 document.getElementById("discoverBtn").addEventListener("click", discover);
 document.getElementById("reloadBtn").addEventListener("click", load);
 document.getElementById("addBaselineBtn").addEventListener("click", () => openBaselineDlg(null));
+document.getElementById("addCfrBtn").addEventListener("click", () => openCfrDlg(null));
 document.getElementById("closeBaselineDlg").addEventListener("click", () => document.getElementById("baselineDlg").close());
 document.getElementById("baselineCancel").addEventListener("click", () => document.getElementById("baselineDlg").close());
 document.getElementById("baselineSave").addEventListener("click", saveBaseline);
+document.getElementById("closeCfrDlg").addEventListener("click", () => document.getElementById("cfrDlg").close());
+document.getElementById("cfrCancel").addEventListener("click", () => document.getElementById("cfrDlg").close());
+document.getElementById("cfrSave").addEventListener("click", saveCfr);
+document.getElementById("cfrDelete").addEventListener("click", deleteCfr);
 document.getElementById("logoutBtn").addEventListener("click", logout);
 document.getElementById("closeDeviceDlg").addEventListener("click", () => document.getElementById("deviceDlg").close());
 document.getElementById("deviceCancel").addEventListener("click", () => document.getElementById("deviceDlg").close());
@@ -1029,6 +1197,13 @@ document.getElementById("baselines").addEventListener("click", (ev) => {
   const raw = tr.getAttribute("data-baseline");
   if(!raw) return;
   try { openBaselineDlg(JSON.parse(raw)); } catch {}
+});
+document.getElementById("controlledRules").addEventListener("click", (ev) => {
+  const tr = ev.target.closest("tr");
+  if(!tr) return;
+  const raw = tr.getAttribute("data-cfr");
+  if(!raw) return;
+  try { openCfrDlg(JSON.parse(raw)); } catch {}
 });
 document.getElementById("rows").addEventListener("click", async (ev) => {
   const btn = ev.target.closest("button");
@@ -1208,6 +1383,379 @@ class App:
         self._stop_event = threading.Event()
         self._scheduler_thread: Optional[threading.Thread] = None
 
+    @staticmethod
+    def _extract_reported_file_entries(payload: Any) -> tuple[Dict[str, Dict[str, Any]], bool]:
+        if not isinstance(payload, dict):
+            return {}, False
+        raw = payload.get("files", None)
+        if raw is None:
+            return {}, False
+        if not isinstance(raw, list):
+            return {}, False
+        out: Dict[str, Dict[str, Any]] = {}
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path") or item.get("name") or "").strip()
+            if not path:
+                continue
+            checksum = item.get("checksum")
+            checksum_s = checksum.strip() if isinstance(checksum, str) and checksum.strip() else None
+            size = item.get("size", None)
+            mtime = item.get("mtime", None)
+            fp: Optional[str] = checksum_s
+            if fp is None and (size is not None or mtime is not None):
+                fp = f"size={size}|mtime={mtime}"
+            if fp is None:
+                continue
+            entry: Dict[str, Any] = {
+                "path": path,
+                "fingerprint": fp,
+                "checksum": checksum_s,
+                "size": size,
+                "mtime": mtime,
+                "encoding": item.get("encoding"),
+                "content_type": item.get("content_type"),
+                "truncated": bool(item.get("truncated", False)),
+            }
+            content_b64 = item.get("content_b64")
+            if isinstance(content_b64, str) and content_b64.strip():
+                entry["content_b64"] = content_b64.strip()
+            else:
+                content = item.get("content")
+                if isinstance(content, str):
+                    entry["content_b64"] = base64.b64encode(content.encode("utf-8")).decode("ascii")
+                    entry["encoding"] = "utf-8"
+            out[path] = entry
+        return out, True
+
+    @staticmethod
+    def _path_matches(pattern: str, path: str) -> bool:
+        pat = str(pattern)
+        p = str(path)
+        if fnmatch.fnmatchcase(p, pat):
+            return True
+        # help windows paths / mixed slashes
+        return fnmatch.fnmatchcase(p.replace("\\", "/"), pat.replace("\\", "/"))
+
+    @classmethod
+    def _select_controlled_files(
+        cls, files: Dict[str, Dict[str, Any]], patterns: List[str]
+    ) -> Dict[str, Dict[str, Any]]:
+        if not files or not patterns:
+            return {}
+        out: Dict[str, Dict[str, Any]] = {}
+        for path, entry in files.items():
+            for pat in patterns:
+                if cls._path_matches(str(pat), path):
+                    out[path] = entry
+                    break
+        return out
+
+    @staticmethod
+    def _device_auth_headers(device: Dict[str, Any]) -> Dict[str, str]:
+        auth_type = str(device.get("auth_type") or "none")
+        auth_token = device.get("auth_token")
+        if not auth_type or auth_type == "none":
+            return {}
+        token = str(auth_token or "")
+        if auth_type == "bearer":
+            return {"Authorization": f"Bearer {token}"}
+        if auth_type == "x-device-token":
+            return {"X-Device-Token": token}
+        return {}
+
+    @staticmethod
+    def _truncate_b64(content_b64: str, *, max_bytes: int) -> tuple[Optional[str], bool]:
+        if max_bytes <= 0:
+            return None, True
+        try:
+            raw = base64.b64decode(content_b64, validate=False)
+        except Exception:
+            return None, False
+        if len(raw) <= max_bytes:
+            return content_b64, False
+        return base64.b64encode(raw[:max_bytes]).decode("ascii"), True
+
+    def _fetch_file_content(
+        self, *, device: Dict[str, Any], path: str, timeout_s: float, max_bytes: int
+    ) -> Optional[Dict[str, Any]]:
+        ip = str(device.get("ip") or "").strip()
+        port = int(device.get("port") or 80)
+        url = f"http://{ip}:{port}/.well-known/device-version/file?path={quote(str(path), safe='')}"
+        headers = {"Accept": "application/json", **self._device_auth_headers(device)}
+        req = urllib.request.Request(url=url, method="GET", headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                status = getattr(resp, "status", None)
+                raw = resp.read()
+        except Exception:
+            return None
+        if status != 200:
+            return None
+        try:
+            payload = json.loads(raw.decode("utf-8", errors="replace"))
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        content_b64 = payload.get("content_b64")
+        if not isinstance(content_b64, str) or not content_b64.strip():
+            return None
+        content_b64 = content_b64.strip()
+        truncated = False
+        trimmed, did_trunc = self._truncate_b64(content_b64, max_bytes=max_bytes)
+        if trimmed is None:
+            return None
+        truncated = did_trunc
+        return {
+            "path": str(payload.get("path") or path),
+            "content_b64": trimmed,
+            "encoding": payload.get("encoding"),
+            "content_type": payload.get("content_type"),
+            "truncated": truncated,
+        }
+
+    def _ensure_observation_for_entry(
+        self,
+        *,
+        device: Dict[str, Any],
+        entry: Dict[str, Any],
+        snapshot_id: int,
+        timeout_s: float,
+        mode: str,
+        max_bytes: int,
+    ) -> Optional[Dict[str, Any]]:
+        path = str(entry.get("path") or "")
+        fp = str(entry.get("fingerprint") or "")
+        if not path or not fp or max_bytes <= 0:
+            return None
+        existing = self.db.get_controlled_file_observation(device_id=int(device["id"]), path=path, fingerprint=fp)
+        if existing:
+            return existing
+
+        source = "inline"
+        content_b64 = entry.get("content_b64")
+        encoding = entry.get("encoding") if isinstance(entry.get("encoding"), str) else None
+        content_type = entry.get("content_type") if isinstance(entry.get("content_type"), str) else None
+        truncated = False
+
+        if mode == "fetch":
+            content_b64 = None
+        if isinstance(content_b64, str) and content_b64.strip() and mode in ("auto", "inline"):
+            trimmed, did_trunc = self._truncate_b64(content_b64.strip(), max_bytes=max_bytes)
+            if trimmed is None:
+                content_b64 = None
+            else:
+                content_b64 = trimmed
+                truncated = did_trunc
+                source = "inline"
+        else:
+            content_b64 = None
+
+        if content_b64 is None and mode in ("auto", "fetch"):
+            fetched = self._fetch_file_content(device=device, path=path, timeout_s=timeout_s, max_bytes=max_bytes)
+            if fetched:
+                content_b64 = fetched.get("content_b64")
+                encoding = fetched.get("encoding") if isinstance(fetched.get("encoding"), str) else encoding
+                content_type = fetched.get("content_type") if isinstance(fetched.get("content_type"), str) else content_type
+                truncated = bool(fetched.get("truncated", False))
+                source = "fetch"
+
+        if not isinstance(content_b64, str) or not content_b64:
+            return None
+
+        self.db.record_controlled_file_observation(
+            device_id=int(device["id"]),
+            path=path,
+            fingerprint=fp,
+            snapshot_id=int(snapshot_id),
+            content_b64=content_b64,
+            encoding=encoding,
+            content_type=content_type,
+            truncated=bool(truncated),
+            source=source,
+        )
+        return self.db.get_controlled_file_observation(device_id=int(device["id"]), path=path, fingerprint=fp)
+
+    def _check_controlled_files(
+        self,
+        *,
+        device: Dict[str, Any],
+        poll_result: Any,
+        prev_success_snapshot: Optional[Dict[str, Any]],
+        current_snapshot_id: int,
+    ) -> None:
+        if not getattr(poll_result, "success", False):
+            return
+        rule = self.db.get_controlled_file_rule(
+            cluster_id=int(device["cluster_id"]),
+            vendor=str(device["vendor"]),
+            model=str(device["model"]),
+        )
+        patterns = (rule or {}).get("paths") or []
+        if not patterns:
+            return
+        mode = str((rule or {}).get("mode") or "auto").strip().lower() or "auto"
+        if mode not in ("auto", "inline", "fetch"):
+            mode = "auto"
+        max_bytes_raw = (rule or {}).get("max_bytes", None)
+        try:
+            max_bytes = int(max_bytes_raw) if max_bytes_raw is not None else 8192
+        except Exception:
+            max_bytes = 8192
+        max_bytes = max(0, min(max_bytes, 2_000_000))
+
+        curr_entries, curr_supported = self._extract_reported_file_entries(getattr(poll_result, "payload", None))
+        if not curr_supported:
+            return
+        prev_payload = prev_success_snapshot.get("payload") if prev_success_snapshot else None
+        prev_entries, prev_supported = self._extract_reported_file_entries(prev_payload)
+
+        curr_sel = self._select_controlled_files(curr_entries, patterns)
+        prev_sel = self._select_controlled_files(prev_entries, patterns) if prev_supported else {}
+        if not curr_sel and not prev_sel:
+            return
+
+        timeout_s = getattr(poll_result, "latency_ms", None)
+        try:
+            timeout_s = float(timeout_s) / 1000.0 if timeout_s is not None else 2.0
+        except Exception:
+            timeout_s = 2.0
+        timeout_s = max(0.2, min(timeout_s, 5.0))
+
+        # store baseline observations (so future diffs have old content)
+        for path, entry in curr_sel.items():
+            try:
+                self._ensure_observation_for_entry(
+                    device=device,
+                    entry=entry,
+                    snapshot_id=int(current_snapshot_id),
+                    timeout_s=timeout_s,
+                    mode=mode,
+                    max_bytes=max_bytes,
+                )
+            except Exception:
+                pass
+
+        # first time supporting files => just establish baseline, no event
+        if not prev_supported:
+            return
+
+        changes: List[Dict[str, Any]] = []
+        for path in sorted(set(prev_sel.keys()) | set(curr_sel.keys())):
+            old_fp = (prev_sel.get(path) or {}).get("fingerprint") if prev_sel.get(path) else None
+            new_fp = (curr_sel.get(path) or {}).get("fingerprint") if curr_sel.get(path) else None
+            if old_fp != new_fp:
+                changes.append({"path": path, "old": old_fp, "new": new_fp})
+        if not changes:
+            return
+
+        # enrich with optional content + diff
+        for ch in changes:
+            path = str(ch.get("path") or "")
+            old_fp = str(ch.get("old") or "") if ch.get("old") is not None else ""
+            new_fp = str(ch.get("new") or "") if ch.get("new") is not None else ""
+
+            old_obs = None
+            prev_entry = prev_sel.get(path)
+            if prev_entry and isinstance(prev_entry.get("content_b64"), str) and old_fp:
+                trimmed, did_trunc = self._truncate_b64(prev_entry["content_b64"], max_bytes=max_bytes)
+                if trimmed is not None:
+                    old_obs = {
+                        "content_b64": trimmed,
+                        "encoding": prev_entry.get("encoding"),
+                        "content_type": prev_entry.get("content_type"),
+                        "truncated": bool(prev_entry.get("truncated", False)) or bool(did_trunc),
+                        "source": "inline",
+                    }
+            if old_obs is None and old_fp:
+                old_obs = self.db.get_controlled_file_observation(
+                    device_id=int(device["id"]), path=path, fingerprint=old_fp
+                )
+
+            new_obs = None
+            curr_entry = curr_sel.get(path)
+            if curr_entry and new_fp:
+                new_obs = self._ensure_observation_for_entry(
+                    device=device,
+                    entry=curr_entry,
+                    snapshot_id=int(current_snapshot_id),
+                    timeout_s=timeout_s,
+                    mode=mode,
+                    max_bytes=max_bytes,
+                )
+
+            if old_obs and isinstance(old_obs.get("content_b64"), str):
+                ch["old_content_b64"] = old_obs.get("content_b64")
+                ch["old_encoding"] = old_obs.get("encoding")
+                ch["old_truncated"] = bool(old_obs.get("truncated", False))
+            if new_obs and isinstance(new_obs.get("content_b64"), str):
+                ch["new_content_b64"] = new_obs.get("content_b64")
+                ch["new_encoding"] = new_obs.get("encoding")
+                ch["new_truncated"] = bool(new_obs.get("truncated", False))
+
+            if (
+                old_obs
+                and new_obs
+                and isinstance(old_obs.get("content_b64"), str)
+                and isinstance(new_obs.get("content_b64"), str)
+                and max_bytes > 0
+            ):
+                try:
+                    old_bytes = base64.b64decode(old_obs["content_b64"], validate=False)
+                    new_bytes = base64.b64decode(new_obs["content_b64"], validate=False)
+                    enc = (
+                        str(new_obs.get("encoding") or old_obs.get("encoding") or "utf-8")
+                        if isinstance(new_obs.get("encoding") or old_obs.get("encoding"), str)
+                        else "utf-8"
+                    )
+                    old_text = old_bytes.decode(enc, errors="replace")
+                    new_text = new_bytes.decode(enc, errors="replace")
+                    diff_lines = difflib.unified_diff(
+                        old_text.splitlines(True),
+                        new_text.splitlines(True),
+                        fromfile=f"{path}@{old_fp or 'old'}",
+                        tofile=f"{path}@{new_fp or 'new'}",
+                        n=3,
+                    )
+                    diff = "".join(diff_lines)
+                    if len(diff) > 50_000:
+                        diff = diff[:50_000] + "\n... (diff truncated)\n"
+                        ch["diff_truncated"] = True
+                    ch["diff_unified"] = diff
+                except Exception:
+                    pass
+
+        event_id = self.db.create_event(
+            device_id=int(device["id"]),
+            event_type="controlled_files_change",
+            old_state=None,
+            new_state=None,
+            message=f"controlled_files_change changed={len(changes)}",
+            payload={
+                "device_id": int(device["id"]),
+                "device_serial": device.get("device_key"),
+                "supplier": device.get("vendor"),
+                "device_type": device.get("model"),
+                "cluster_id": int(device["cluster_id"]),
+                "rule_id": int(rule["id"]) if rule and rule.get("id") is not None else None,
+                "patterns": patterns,
+                "mode": mode,
+                "max_bytes": max_bytes,
+                "changes": changes,
+                "prev_snapshot_id": int(prev_success_snapshot["id"]) if prev_success_snapshot else None,
+                "current_snapshot_id": int(current_snapshot_id),
+            },
+        )
+        self._notify_webhook(
+            {
+                "event_id": event_id,
+                "event_type": "controlled_files_change",
+                "timestamp": _utc_now_iso(),
+            }
+        )
+
     def poll_and_record(self, device: Dict[str, Any], *, timeout_s: float = 2.0) -> Dict[str, Any]:
         device_id = int(device["id"])
         prev = self.db.get_latest_success_snapshot(device_id)
@@ -1216,7 +1764,7 @@ class App:
         res = poll_device(device, timeout_s=timeout_s)
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         latency_ms = res.latency_ms if res.latency_ms is not None else elapsed_ms
-        self.db.record_snapshot(
+        snapshot_id = self.db.record_snapshot(
             device_id=device_id,
             success=res.success,
             http_status=res.http_status,
@@ -1307,8 +1855,18 @@ class App:
                         "timestamp": _utc_now_iso(),
                     }
                 )
+        try:
+            self._check_controlled_files(
+                device=device,
+                poll_result=res,
+                prev_success_snapshot=prev,
+                current_snapshot_id=snapshot_id,
+            )
+        except Exception:
+            pass
         return {
             "device_id": device_id,
+            "snapshot_id": snapshot_id,
             "success": res.success,
             "http_status": res.http_status,
             "latency_ms": latency_ms,
@@ -1518,6 +2076,9 @@ class VersionManagerHandler(BaseHTTPRequestHandler):
                 return _send_json(self, 404, {"error": "not_found"})
             snap = self.app.db.get_latest_snapshot(device_id)
             base = self.app.db.get_baseline(cluster_id=int(dev["cluster_id"]), vendor=str(dev["vendor"]), model=str(dev["model"]))
+            cfr = self.app.db.get_controlled_file_rule(
+                cluster_id=int(dev["cluster_id"]), vendor=str(dev["vendor"]), model=str(dev["model"])
+            )
             observed_catalog = None
             expected_catalog = None
             try:
@@ -1542,6 +2103,7 @@ class VersionManagerHandler(BaseHTTPRequestHandler):
                 {
                     "device": _present_device(dev),
                     "baseline": _present_baseline(base),
+                    "controlled_file_rule": _present_controlled_file_rule(cfr),
                     "latest_snapshot": snap,
                     "observed_version_catalog": observed_catalog,
                     "expected_version_catalog": expected_catalog,
@@ -1553,6 +2115,16 @@ class VersionManagerHandler(BaseHTTPRequestHandler):
                 return
             cluster_id = qs.get("cluster_id", [None])[0]
             items = [_present_baseline(x) for x in self.app.db.list_baselines(cluster_id=int(cluster_id) if cluster_id else None)]
+            return _send_json(self, 200, {"items": items})
+
+        if parts[:3] == ["api", "v1", "controlled-file-rules"] and len(parts) == 3:
+            if not self._require_login():
+                return
+            cluster_id = qs.get("cluster_id", [None])[0]
+            items = [
+                _present_controlled_file_rule(x)
+                for x in self.app.db.list_controlled_file_rules(cluster_id=int(cluster_id) if cluster_id else None)
+            ]
             return _send_json(self, 200, {"items": items})
 
         if parts[:3] == ["api", "v1", "version-catalog"] and len(parts) == 3:
@@ -1908,6 +2480,40 @@ class VersionManagerHandler(BaseHTTPRequestHandler):
             )
             return _send_json(self, 201, {"ok": True})
 
+        if parts[:3] == ["api", "v1", "controlled-file-rules"] and len(parts) == 3:
+            if not self._require_admin():
+                return
+            try:
+                body = _read_json(self)
+            except ValueError as e:
+                return _send_json(self, 400, {"error": str(e)})
+            try:
+                cluster_id = int(body.get("cluster_id"))
+                supplier = _get_body_str(body, "supplier").strip()
+                device_type = _get_body_str(body, "device_type").strip()
+                paths = body.get("paths")
+                mode = body.get("mode")
+                max_bytes = body.get("max_bytes")
+                note = body.get("note")
+            except Exception as e:  # noqa: BLE001
+                return _send_json(self, 400, {"error": f"invalid_request:{e}"})
+            if not supplier or not device_type:
+                return _send_json(self, 400, {"error": "missing_fields"})
+            if isinstance(paths, str):
+                paths = [x.strip() for x in paths.split(",") if x.strip()]
+            if not isinstance(paths, list):
+                paths = []
+            self.app.db.upsert_controlled_file_rule(
+                cluster_id=cluster_id,
+                vendor=supplier,
+                model=device_type,
+                paths=[str(x) for x in paths],
+                mode=str(mode) if mode is not None else None,
+                max_bytes=max_bytes,
+                note=note,
+            )
+            return _send_json(self, 201, {"ok": True})
+
         if parts[:3] == ["api", "v1", "version-catalog"] and len(parts) == 3:
             if not self._require_admin():
                 return
@@ -2172,6 +2778,17 @@ class VersionManagerHandler(BaseHTTPRequestHandler):
             except ValueError:
                 return _send_json(self, 400, {"error": "invalid_baseline_id"})
             if not self.app.db.delete_baseline(baseline_id):
+                return _send_json(self, 404, {"error": "not_found"})
+            return _send_json(self, 200, {"ok": True})
+
+        if parts[:3] == ["api", "v1", "controlled-file-rules"] and len(parts) == 4:
+            if not self._require_admin():
+                return
+            try:
+                rule_id = int(parts[3])
+            except ValueError:
+                return _send_json(self, 400, {"error": "invalid_rule_id"})
+            if not self.app.db.delete_controlled_file_rule(rule_id):
                 return _send_json(self, 404, {"error": "not_found"})
             return _send_json(self, 200, {"ok": True})
 

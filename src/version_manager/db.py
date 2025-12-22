@@ -94,6 +94,40 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS idx_baselines_lookup ON baselines(cluster_id, vendor, model);
 
+                CREATE TABLE IF NOT EXISTS controlled_file_rules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cluster_id INTEGER NOT NULL,
+                    vendor TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    paths_json TEXT NOT NULL,
+                    mode TEXT,
+                    max_bytes INTEGER,
+                    note TEXT,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(cluster_id, vendor, model),
+                    FOREIGN KEY(cluster_id) REFERENCES clusters(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_controlled_file_rules_lookup ON controlled_file_rules(cluster_id, vendor, model);
+
+                CREATE TABLE IF NOT EXISTS controlled_file_observations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    device_id INTEGER NOT NULL,
+                    path TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    snapshot_id INTEGER,
+                    content_b64 TEXT,
+                    encoding TEXT,
+                    content_type TEXT,
+                    truncated INTEGER NOT NULL,
+                    source TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(device_id, path, fingerprint),
+                    FOREIGN KEY(device_id) REFERENCES devices(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_controlled_file_observations_lookup ON controlled_file_observations(device_id, path, fingerprint);
+
                 CREATE TABLE IF NOT EXISTS version_catalog (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     vendor TEXT NOT NULL,
@@ -178,6 +212,10 @@ class Database:
             self._conn.execute("ALTER TABLE devices ADD COLUMN line_no TEXT;")
         if not has_column("baselines", "allowed_main_globs_json"):
             self._conn.execute("ALTER TABLE baselines ADD COLUMN allowed_main_globs_json TEXT;")
+        if not has_column("controlled_file_rules", "mode"):
+            self._conn.execute("ALTER TABLE controlled_file_rules ADD COLUMN mode TEXT;")
+        if not has_column("controlled_file_rules", "max_bytes"):
+            self._conn.execute("ALTER TABLE controlled_file_rules ADD COLUMN max_bytes INTEGER;")
 
     def has_any_user(self) -> bool:
         rows = self._query("SELECT 1 AS x FROM users LIMIT 1")
@@ -564,6 +602,148 @@ class Database:
         with self._lock, self._conn:
             cur = self._conn.execute("DELETE FROM baselines WHERE id = ?", (int(baseline_id),))
             return int(cur.rowcount or 0) > 0
+
+    def upsert_controlled_file_rule(
+        self,
+        *,
+        cluster_id: int,
+        vendor: str,
+        model: str,
+        paths: List[str],
+        mode: Optional[str] = None,
+        max_bytes: Optional[int] = None,
+        note: Optional[str] = None,
+    ) -> int:
+        now = _utc_now_iso()
+        cleaned: List[str] = []
+        seen: set[str] = set()
+        for p in paths or []:
+            s = str(p).strip()
+            if not s or s in seen:
+                continue
+            cleaned.append(s)
+            seen.add(s)
+        paths_json = json.dumps(cleaned, ensure_ascii=False)
+        mode_clean = str(mode or "").strip().lower() or None
+        if mode_clean not in (None, "auto", "inline", "fetch"):
+            mode_clean = None
+        max_bytes_i: Optional[int] = None
+        if max_bytes is not None:
+            try:
+                max_bytes_i = int(max_bytes)
+            except Exception:
+                max_bytes_i = None
+        if max_bytes_i is not None:
+            max_bytes_i = max(0, min(max_bytes_i, 2_000_000))
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                """
+                INSERT INTO controlled_file_rules(cluster_id, vendor, model, paths_json, mode, max_bytes, note, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(cluster_id, vendor, model) DO UPDATE SET
+                    paths_json = excluded.paths_json,
+                    mode = excluded.mode,
+                    max_bytes = excluded.max_bytes,
+                    note = excluded.note
+                """,
+                (int(cluster_id), str(vendor), str(model), paths_json, mode_clean, max_bytes_i, note, now),
+            )
+            return int(cur.lastrowid) if cur.lastrowid else 0
+
+    def list_controlled_file_rules(self, *, cluster_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        wheres: List[str] = []
+        params: List[Any] = []
+        if cluster_id is not None:
+            wheres.append("cluster_id = ?")
+            params.append(int(cluster_id))
+        where_sql = f"WHERE {' AND '.join(wheres)}" if wheres else ""
+        rows = self._query(
+            f"""
+            SELECT id, cluster_id, vendor, model, paths_json, mode, max_bytes, note, created_at
+            FROM controlled_file_rules
+            {where_sql}
+            ORDER BY id ASC
+            """,
+            tuple(params),
+        )
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            d["paths"] = self._parse_globs(d.get("paths_json"))
+            out.append(d)
+        return out
+
+    def get_controlled_file_rule(self, *, cluster_id: int, vendor: str, model: str) -> Optional[Dict[str, Any]]:
+        rows = self._query(
+            """
+            SELECT id, cluster_id, vendor, model, paths_json, mode, max_bytes, note, created_at
+            FROM controlled_file_rules
+            WHERE cluster_id = ? AND vendor = ? AND model = ?
+            LIMIT 1
+            """,
+            (int(cluster_id), str(vendor), str(model)),
+        )
+        if not rows:
+            return None
+        d = dict(rows[0])
+        d["paths"] = self._parse_globs(d.get("paths_json"))
+        return d
+
+    def delete_controlled_file_rule(self, rule_id: int) -> bool:
+        with self._lock, self._conn:
+            cur = self._conn.execute("DELETE FROM controlled_file_rules WHERE id = ?", (int(rule_id),))
+            return int(cur.rowcount or 0) > 0
+
+    def record_controlled_file_observation(
+        self,
+        *,
+        device_id: int,
+        path: str,
+        fingerprint: str,
+        snapshot_id: Optional[int],
+        content_b64: Optional[str],
+        encoding: Optional[str],
+        content_type: Optional[str],
+        truncated: bool,
+        source: str,
+    ) -> None:
+        now = _utc_now_iso()
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT OR IGNORE INTO controlled_file_observations(
+                    device_id, path, fingerprint, snapshot_id,
+                    content_b64, encoding, content_type, truncated, source, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(device_id),
+                    str(path),
+                    str(fingerprint),
+                    int(snapshot_id) if snapshot_id is not None else None,
+                    content_b64,
+                    encoding,
+                    content_type,
+                    1 if truncated else 0,
+                    str(source),
+                    now,
+                ),
+            )
+
+    def get_controlled_file_observation(
+        self, *, device_id: int, path: str, fingerprint: str
+    ) -> Optional[Dict[str, Any]]:
+        rows = self._query(
+            """
+            SELECT id, device_id, path, fingerprint, snapshot_id, content_b64, encoding, content_type, truncated, source, created_at
+            FROM controlled_file_observations
+            WHERE device_id = ? AND path = ? AND fingerprint = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (int(device_id), str(path), str(fingerprint)),
+        )
+        return dict(rows[0]) if rows else None
 
     @staticmethod
     def _parse_globs(raw: Any) -> List[str]:

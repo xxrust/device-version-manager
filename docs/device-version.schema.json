@@ -42,6 +42,24 @@
         "additionalProperties": true
       }
     },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "checksum": { "type": "string" },
+          "size": { "type": "integer" },
+          "mtime": {},
+          "encoding": { "type": "string" },
+          "content_type": { "type": "string" },
+          "content_b64": { "type": "string" },
+          "truncated": { "type": "boolean" }
+        },
+        "additionalProperties": true
+      }
+    },
     "build": {
       "type": "object",
       "properties": {

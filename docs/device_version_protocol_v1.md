@@ -53,6 +53,7 @@
 - `device` (object, MUST)
 - `versions` (object, MUST)
 - `components` (array, SHOULD)
+- `files` (array, SHOULD)：受控文件摘要（用于配置/模板等变更监控）
 - `build` (object, SHOULD)
 - `timestamp` (string, SHOULD)：设备端生成的 ISO-8601 时间
 
@@ -79,6 +80,46 @@
 - `checksum` (string, SHOULD)：推荐 `sha256:<hex>`
 - `build` (string, SHOULD)：构建号/提交号
 
+### files（可选，受控文件摘要）
+
+数组元素对象：
+
+- `path` (string, MUST)：文件路径/标识（建议稳定且可读，如 `/etc/app/config.yml`）
+- `checksum` (string, SHOULD)：推荐 `sha256:<hex>`（或其他稳定校验值）
+- `size` (integer, SHOULD)：文件大小（字节）
+- `mtime` (string|integer, SHOULD)：修改时间（ISO-8601 或 Unix 时间戳）
+- `encoding` (string, SHOULD)：当提供内容时的文本编码（如 `utf-8`）
+- `content_type` (string, SHOULD)：内容类型（如 `application/json`、`text/yaml`）
+- `content_b64` (string, SHOULD)：文件内容的 Base64（适合小文件；可被管理器截断）
+- `truncated` (boolean, SHOULD)：设备端指示内容是否已截断（可选）
+
+说明（管理器验证方式）：
+
+- 管理器侧可配置“受控文件规则”：按 `集群 + 供应商 + 设备型号` 维护一组 glob，用于匹配 `files[].path`
+- 仅对命中规则的 `path` 做比对，并且是“本次成功拉取” vs “上一次成功拉取”
+- 优先使用 `checksum` 做变化判断；如果缺少 `checksum` 但提供了 `size`/`mtime`，管理器会退化为比较 `size+mtime` 组合（准确性不如内容哈希）
+- 如果检测到变化，会生成 `controlled_files_change` 事件用于提示/告警
+
+### 受控文件内容端点（可选，推荐）
+
+当不希望在 `device-version` 中内联大文件/敏感内容时，可以额外实现“按需拉取文件内容”端点：
+
+- `GET /.well-known/device-version/file?path=<urlencoded>`
+- 需要鉴权时沿用 `device-version` 的鉴权方式（Bearer / X-Device-Token）
+- 成功：HTTP 200 + JSON（至少包含 `path` 与 `content_b64`）
+- 失败：HTTP 404（不提供该文件），或 401/503 等
+
+返回示例：
+
+```json
+{
+  "path": "/etc/app/config.yml",
+  "encoding": "utf-8",
+  "content_type": "text/yaml",
+  "content_b64": "Li4u"
+}
+```
+
 ### build（可选）
 
 - `build.git` (string, SHOULD)：提交哈希
@@ -97,6 +138,10 @@
   "components": [
     { "name": "vision-algo", "version": "2.4.1", "checksum": "sha256:..." },
     { "name": "ui", "version": "1.8.2", "build": "20251217.1" }
+  ],
+  "files": [
+    { "path": "/etc/app/config.yml", "checksum": "sha256:..." },
+    { "path": "/opt/app/templates/default.json", "checksum": "sha256:..." }
   ],
   "build": { "git": "8c1a2d9", "time": "2025-12-16T12:01:03Z" }
 }

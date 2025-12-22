@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 
 def _utc_now_iso() -> str:
@@ -39,6 +41,40 @@ class MockDeviceHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"ok")
             return
 
+        if parsed.path == "/.well-known/device-version/file":
+            if not self._auth_ok():
+                self.send_response(401)
+                self.end_headers()
+                return
+            qs = parse_qs(parsed.query)
+            path = (qs.get("path") or [None])[0]
+            if not path:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(b'{"error":"missing_path"}')
+                return
+            files = self.cfg.get("file_contents") or {}
+            item = files.get(str(path))
+            if not isinstance(item, dict):
+                self.send_response(404)
+                self.end_headers()
+                return
+            payload = {
+                "path": str(path),
+                "checksum": item.get("checksum"),
+                "encoding": item.get("encoding"),
+                "content_type": item.get("content_type"),
+                "content_b64": item.get("content_b64"),
+            }
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
         if parsed.path != "/.well-known/device-version":
             self.send_response(404)
             self.end_headers()
@@ -65,6 +101,8 @@ class MockDeviceHandler(BaseHTTPRequestHandler):
             payload["versions"]["firmware"] = self.cfg["firmware"]
         if self.cfg.get("components"):
             payload["components"] = self.cfg["components"]
+        if self.cfg.get("files"):
+            payload["files"] = self.cfg["files"]
 
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(200)
@@ -84,7 +122,97 @@ def main() -> None:
     p.add_argument("--version", dest="main_version", default="1.0.0")
     p.add_argument("--firmware", default=None)
     p.add_argument("--token", default=None, help="Optional token (accepts Bearer or X-Device-Token)")
+    p.add_argument(
+        "--file",
+        dest="files",
+        action="append",
+        default=[],
+        help="Optional reported file fingerprint: <path>=<checksum> (checksum recommended sha256:<hex>)",
+    )
+    p.add_argument(
+        "--file-content",
+        dest="file_contents",
+        action="append",
+        default=[],
+        help="Optional file content for inline/fetch: <path>=<text> or <path>=@<localfile>",
+    )
+    p.add_argument(
+        "--inline-file-content",
+        action="store_true",
+        help="Include content_b64 in the main /.well-known/device-version response (default: only expose via /file endpoint).",
+    )
     args = p.parse_args()
+
+    def guess_content_type(path: str) -> str:
+        pth = path.lower()
+        if pth.endswith(".json"):
+            return "application/json"
+        if pth.endswith(".yml") or pth.endswith(".yaml"):
+            return "text/yaml"
+        if pth.endswith(".toml"):
+            return "application/toml"
+        if pth.endswith(".ini") or pth.endswith(".cfg"):
+            return "text/plain"
+        return "application/octet-stream"
+
+    file_contents: Dict[str, Dict[str, Any]] = {}
+    for spec in args.file_contents or []:
+        s = str(spec or "").strip()
+        if not s or "=" not in s:
+            continue
+        path, value = s.split("=", 1)
+        path = path.strip()
+        value = value.strip()
+        if not path:
+            continue
+        if value.startswith("@") and len(value) > 1:
+            try:
+                raw = open(value[1:], "rb").read()
+            except Exception:
+                raw = value.encode("utf-8")
+        else:
+            raw = value.encode("utf-8")
+        checksum = "sha256:" + hashlib.sha256(raw).hexdigest()
+        file_contents[path] = {
+            "checksum": checksum,
+            "encoding": "utf-8",
+            "content_type": guess_content_type(path),
+            "content_b64": base64.b64encode(raw).decode("ascii"),
+        }
+
+    files = []
+    for spec in args.files or []:
+        s = str(spec or "").strip()
+        if not s:
+            continue
+        if "=" in s:
+            path, checksum = s.split("=", 1)
+            path = path.strip()
+            checksum = checksum.strip()
+        else:
+            path, checksum = s, ""
+        if not path:
+            continue
+        if not checksum:
+            checksum = "sha256:" + hashlib.sha256(path.encode("utf-8")).hexdigest()
+        files.append({"path": path, "checksum": checksum})
+
+    # merge file_contents into files list (ensure checksum present)
+    for path, meta in file_contents.items():
+        exists = next((x for x in files if x.get("path") == path), None)
+        if exists is None:
+            files.append({"path": path, "checksum": meta.get("checksum")})
+        else:
+            exists["checksum"] = exists.get("checksum") or meta.get("checksum")
+
+    if args.inline_file_content:
+        for item in files:
+            meta = file_contents.get(str(item.get("path") or ""))
+            if not meta:
+                continue
+            item["encoding"] = meta.get("encoding")
+            item["content_type"] = meta.get("content_type")
+            item["content_b64"] = meta.get("content_b64")
 
     httpd = ThreadingHTTPServer((args.host, args.port), MockDeviceHandler)
     httpd.cfg = {  # type: ignore[attr-defined]
@@ -94,10 +222,11 @@ def main() -> None:
         "main_version": args.main_version,
         "firmware": args.firmware,
         "token": args.token,
+        "files": files,
+        "file_contents": file_contents,
     }
     httpd.serve_forever()
 
 
 if __name__ == "__main__":
     main()
-
