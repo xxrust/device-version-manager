@@ -62,7 +62,20 @@ def _build_files_payload() -> list[dict]:
         if not p:
             continue
         raw = _read_file_bytes(p)
+        exists = os.path.exists(p)
         if raw is None:
+            # If the file can't be read (permissions/locks), still report path + size/mtime when available,
+            # so the server can at least see the path and use size+mtime as a weak fingerprint.
+            if not exists:
+                continue
+            items.append(
+                {
+                    "path": p,
+                    "checksum": None,
+                    "size": int(os.path.getsize(p)) if exists else None,
+                    "mtime": int(os.path.getmtime(p)) if exists else None,
+                }
+            )
             continue
 
         item = {
@@ -112,6 +125,11 @@ class H(BaseHTTPRequestHandler):
 
             if getattr(cfg, "CONTROLLED_PATHS", None):
                 payload["files"] = _build_files_payload()
+            else:
+                # Always include key if CONTROLLED_PATHS is present in config (even empty),
+                # so it's easier to debug whether the device supports files reporting.
+                if hasattr(cfg, "CONTROLLED_PATHS"):
+                    payload["files"] = []
 
             return _send_json(self, 200, payload)
 
@@ -150,4 +168,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

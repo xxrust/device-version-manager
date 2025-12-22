@@ -91,6 +91,9 @@ def _send_json(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> No
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Pragma", "no-cache")
+    handler.send_header("Expires", "0")
     handler.send_header("Content-Length", str(len(data)))
     handler.end_headers()
     handler.wfile.write(data)
@@ -100,6 +103,9 @@ def _send_html(handler: BaseHTTPRequestHandler, status: int, html: str) -> None:
     data = html.encode("utf-8")
     handler.send_response(status)
     handler.send_header("Content-Type", "text/html; charset=utf-8")
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Pragma", "no-cache")
+    handler.send_header("Expires", "0")
     handler.send_header("Content-Length", str(len(data)))
     handler.end_headers()
     handler.wfile.write(data)
@@ -263,6 +269,7 @@ def _dashboard_html() -> str:
     .b-ok{ border-color: rgba(46,125,50,.20); background: rgba(46,125,50,.08); color: var(--ok); }
     .b-mismatch{ border-color: rgba(211,47,47,.20); background: rgba(211,47,47,.08); color: var(--bad); }
     .b-offline{ border-color: rgba(237,108,2,.20); background: rgba(237,108,2,.08); color: var(--warn); }
+    .b-files_changed{ border-color: rgba(237,108,2,.22); background: rgba(237,108,2,.10); color: var(--warn); }
     .b-no_baseline, .b-never_polled, .b-unknown{ border-color: rgba(63,81,181,.20); background: rgba(63,81,181,.08); color: var(--info); }
     .mono{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     .row{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
@@ -306,6 +313,7 @@ def _dashboard_html() -> str:
           <h2>设备状态</h2>
           <div class="row">
             <button class="btn" id="pollAll">拉取全部</button>
+            <span class="small muted" id="pollOut"></span>
             <span class="pill mono" id="lastUpdate"></span>
           </div>
         </div>
@@ -315,6 +323,7 @@ def _dashboard_html() -> str:
             <select id="filterState" style="width:160px;">
               <option value="">全部状态</option>
               <option value="ok">ok</option>
+              <option value="files_changed">文件变更</option>
               <option value="mismatch">mismatch</option>
               <option value="offline">offline</option>
               <option value="no_baseline">no_baseline</option>
@@ -583,6 +592,69 @@ def _dashboard_html() -> str:
         <label class="small">错误</label>
         <div class="pill" id="dErr"></div>
       </div>
+      <details>
+        <summary class="small">受控文件</summary>
+        <div style="height:8px;"></div>
+        <div class="field">
+          <label class="small">规则（glob）</label>
+          <pre class="mono" id="dCfrRule" style="white-space:pre-wrap; border:1px solid var(--border); border-radius:12px; padding:10px; background: var(--surface2);"></pre>
+          <div class="small muted" id="dCfrNote"></div>
+        </div>
+        <div class="field">
+          <label class="small">设备上报的文件（来自最新拉取 payload.files）</label>
+          <div style="overflow:auto; max-height:220px; border:1px solid var(--border); border-radius:12px; background: var(--surface2);">
+            <table>
+              <thead>
+                <tr>
+                  <th style="width:46px;">选</th>
+                  <th style="width:52px;">匹配</th>
+                  <th>路径</th>
+                  <th>指纹</th>
+                  <th>checksum</th>
+                  <th>size</th>
+                  <th>mtime</th>
+                </tr>
+              </thead>
+              <tbody id="dCfrRows"></tbody>
+            </table>
+          </div>
+          <div class="row" style="margin-top:8px; align-items:center;">
+            <button class="btn ghost" id="dCfrSelAll">全选</button>
+            <button class="btn ghost" id="dCfrSelNone">全不选</button>
+            <button class="btn ghost" id="dCfrSelMatched">选匹配</button>
+            <button class="btn" id="dCfrImport">导入为受控文件规则…</button>
+            <span class="small muted" id="dCfrImportOut"></span>
+          </div>
+          <div class="small muted" id="dCfrHint"></div>
+        </div>
+        <div class="field">
+          <label class="small">最近一次受控文件变更（来自 events）</label>
+          <div class="row" style="justify-content:space-between; align-items:center;">
+            <div class="small muted" id="dCfrChgMeta"></div>
+            <div class="row">
+              <button class="btn ghost" id="dCfrAck">清除提示</button>
+              <span class="small muted" id="dCfrAckOut"></span>
+            </div>
+          </div>
+          <div style="overflow:auto; max-height:220px; border:1px solid var(--border); border-radius:12px; background: var(--surface2);">
+            <table>
+              <thead>
+                <tr>
+                  <th>路径</th>
+                  <th>old</th>
+                  <th>new</th>
+                  <th>diff</th>
+                </tr>
+              </thead>
+              <tbody id="dCfrChgRows"></tbody>
+            </table>
+          </div>
+          <details style="margin-top:8px;">
+            <summary class="small">diff 内容</summary>
+            <pre class="mono" id="dCfrChgDiff" style="white-space:pre-wrap; border:1px solid var(--border); border-radius:12px; padding:10px; background: var(--surface2);"></pre>
+          </details>
+        </div>
+      </details>
       <details open>
         <summary class="small">版本历史 / 更新内容</summary>
         <div style="height:8px;"></div>
@@ -629,7 +701,10 @@ def _dashboard_html() -> str:
 <script>
 const badge = (state) => {
   const cls = "badge b-" + state;
-  return `<span class="${cls}">${state}</span>`;
+  const label = ({
+    "files_changed": "文件变更",
+  })[String(state || "")] || state;
+  return `<span class="${cls}">${label}</span>`;
 }
 const fmt = (s) => s ? s : "";
 const esc = (s) => String(s ?? "")
@@ -638,15 +713,206 @@ const esc = (s) => String(s ?? "")
   .replaceAll(">", "&gt;")
   .replaceAll('"', "&quot;")
   .replaceAll("'", "&#39;");
-let currentDetailId = null;
-let currentDetailSupplier = null;
-let currentDetailDeviceType = null;
-let currentVersionHistory = [];
-let currentObservedCatalog = null;
-let statusItems = [];
-let statusById = {};
-let filterState = "";
-let filterQuery = "";
+ let currentDetailId = null;
+ let currentDetailClusterId = null;
+ let currentDetailSupplier = null;
+ let currentDetailDeviceType = null;
+ let currentVersionHistory = [];
+ let currentObservedCatalog = null;
+ let currentDetailCfrRule = null;
+ let currentDetailReportedFiles = [];
+ let statusItems = [];
+ let statusById = {};
+ let filterState = "";
+ let filterQuery = "";
+
+function globToRegExp(glob){
+  const g = String(glob ?? "");
+  let re = "^";
+  for(let i=0;i<g.length;i++){
+    const c = g[i];
+    if(c === "*"){ re += ".*"; continue; }
+    if(c === "?"){ re += "."; continue; }
+    if(c === "["){
+      let j = i + 1;
+      if(j < g.length && (g[j] === "!" || g[j] === "^")) j++;
+      while(j < g.length && g[j] !== "]") j++;
+      if(j < g.length){
+        const cls = g.slice(i, j + 1);
+        re += cls[1] === "!" ? ("[^" + cls.slice(2, -1) + "]") : cls;
+        i = j;
+        continue;
+      }
+      re += "\\\\[";
+      continue;
+    }
+    re += String(c).replace(/[\\\\^$+?.()|{}]/g, "\\\\$&");
+  }
+  re += "$";
+  return new RegExp(re);
+}
+
+function normalizePath(p){
+  return String(p ?? "").replace(/\\\\/g, "/");
+}
+
+function fileFingerprint(item){
+  const checksum = (item && typeof item.checksum === "string" && item.checksum.trim()) ? item.checksum.trim() : "";
+  if(checksum) return checksum;
+  const size = item ? item.size : null;
+  const mtime = item ? item.mtime : null;
+  if(size !== null && size !== undefined || mtime !== null && mtime !== undefined) return `size=${size}|mtime=${mtime}`;
+  return "";
+}
+
+function selectControlledFiles(files, patterns){
+  const pats = Array.isArray(patterns) ? patterns.map(p => String(p ?? "").trim()).filter(Boolean) : [];
+  if(!files || !Array.isArray(files) || !pats.length) return [];
+  const matchers = pats.map(p => ({ raw: p, re: globToRegExp(normalizePath(p)) }));
+  const out = [];
+  for(const it of files){
+    if(!it || typeof it !== "object") continue;
+    const path = normalizePath(it.path || it.name || "");
+    if(!path) continue;
+    if(matchers.some(m => m.re.test(path))) out.push(Object.assign({}, it, { path }));
+  }
+  out.sort((a,b) => String(a.path||"").localeCompare(String(b.path||"")));
+  return out;
+}
+
+function _getReportedFiles(payload){
+  const raw = (payload && Array.isArray(payload.files)) ? payload.files : null;
+  if(!raw) return [];
+  const out = [];
+  for(const it of raw){
+    if(!it || typeof it !== "object") continue;
+    const path = normalizePath(it.path || it.name || "");
+    if(!path) continue;
+    out.push(Object.assign({}, it, { path }));
+  }
+  out.sort((a,b) => String(a.path||"").localeCompare(String(b.path||"")));
+  return out;
+}
+
+function renderControlledFiles(rule, payload){
+  const ruleEl = document.getElementById("dCfrRule");
+  const noteEl = document.getElementById("dCfrNote");
+  const hintEl = document.getElementById("dCfrHint");
+  const tbody = document.getElementById("dCfrRows");
+  if(ruleEl) ruleEl.textContent = "";
+  if(noteEl) noteEl.textContent = "";
+  if(hintEl) hintEl.textContent = "";
+  if(tbody) tbody.innerHTML = "";
+
+  currentDetailCfrRule = rule || null;
+
+  const paths = (rule && Array.isArray(rule.paths)) ? rule.paths : [];
+  const mode = rule ? String(rule.mode || "auto") : "auto";
+  const maxBytes = rule && rule.max_bytes !== undefined && rule.max_bytes !== null ? String(rule.max_bytes) : "";
+  const note = rule ? String(rule.note || "") : "";
+  if(ruleEl) ruleEl.textContent = paths.length ? paths.join("\\n") : "未配置";
+  if(noteEl) noteEl.textContent = [note ? `备注：${note}` : "", `模式：${mode}${maxBytes ? `，最大内容：${maxBytes}` : ""}`].filter(Boolean).join(" ");
+
+  const reported = _getReportedFiles(payload);
+  currentDetailReportedFiles = reported;
+  if(!reported.length){
+    if(hintEl){
+      hintEl.textContent = paths.length
+        ? "最新拉取结果没有 payload.files（设备未上报 files 或拉取失败），仅展示规则。"
+        : "暂无 payload.files（设备未上报 files 或拉取失败）。如果设备已上报，可在此选择并导入为受控文件规则。";
+    }
+    return;
+  }
+
+  const matchedSet = new Set();
+  if(paths.length){
+    for(const it of selectControlledFiles(reported, paths)){
+      matchedSet.add(String(it.path || ""));
+    }
+  }
+  const matchedCount = matchedSet.size;
+  if(hintEl){
+    hintEl.textContent = paths.length
+      ? `files=${reported.length}，匹配=${matchedCount}。可选择部分文件导入/补全受控文件规则。`
+      : `files=${reported.length}。可选择部分文件导入为受控文件规则。`;
+  }
+
+  for(const it of reported){
+    const tr = document.createElement("tr");
+    const checksum = (typeof it.checksum === "string" && it.checksum.trim()) ? it.checksum.trim() : "";
+    const path = String(it.path || "");
+    const isMatched = matchedSet.has(path);
+    tr.innerHTML = `
+      <td class="mono"><input type="checkbox" class="cfrPick" data-path="${esc(path)}" /></td>
+      <td class="mono">${isMatched ? "✓" : ""}</td>
+      <td class="mono">${esc(path)}</td>
+      <td class="mono">${esc(fileFingerprint(it))}</td>
+      <td class="mono">${esc(checksum)}</td>
+      <td class="mono">${esc(fmt(it.size))}</td>
+      <td class="mono">${esc(fmt(it.mtime))}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+}
+
+function _setCfrAll(checked){
+  const picks = Array.from(document.querySelectorAll("#dCfrRows .cfrPick"));
+  for(const el of picks){ el.checked = !!checked; }
+}
+
+function _setCfrMatchedOnly(){
+  const picks = Array.from(document.querySelectorAll("#dCfrRows .cfrPick"));
+  const rule = currentDetailCfrRule || null;
+  const paths = (rule && Array.isArray(rule.paths)) ? rule.paths : [];
+  if(!paths.length || !currentDetailReportedFiles.length){
+    for(const el of picks){ el.checked = false; }
+    return;
+  }
+  const matched = new Set(selectControlledFiles(currentDetailReportedFiles, paths).map(x => String(x.path || "")));
+  for(const el of picks){
+    const p = String(el.getAttribute("data-path") || "");
+    el.checked = matched.has(p);
+  }
+}
+
+function _getCfrSelectedPaths(){
+  const picks = Array.from(document.querySelectorAll("#dCfrRows .cfrPick"));
+  const out = [];
+  const seen = new Set();
+  for(const el of picks){
+    if(!el.checked) continue;
+    const p = String(el.getAttribute("data-path") || "").trim();
+    if(!p || seen.has(p)) continue;
+    out.push(p);
+    seen.add(p);
+  }
+  return out;
+}
+
+function importCfrFromDeviceSelection(){
+  const out = document.getElementById("dCfrImportOut");
+  if(out) out.textContent = "";
+  const cluster_id = Number(currentDetailClusterId || 0);
+  const supplier = String(currentDetailSupplier || "").trim();
+  const device_type = String(currentDetailDeviceType || "").trim();
+  const selected = _getCfrSelectedPaths();
+  if(!cluster_id || !supplier || !device_type){
+    if(out) out.textContent = "missing_fields";
+    return;
+  }
+  if(!selected.length){
+    if(out) out.textContent = "请先勾选要导入的文件";
+    return;
+  }
+  const existing = currentDetailCfrRule || null;
+  const mode = existing ? (existing.mode || "auto") : "auto";
+  const max_bytes = existing && existing.max_bytes !== null && existing.max_bytes !== undefined ? existing.max_bytes : 8192;
+  const note = existing && existing.note ? String(existing.note || "") : "";
+  const stamp = new Date().toISOString();
+  const importNote = note ? `${note} | imported ${stamp}` : `imported ${stamp} from device ${currentDetailId || ""}`;
+  openCfrDlg({cluster_id, supplier, device_type, paths: selected, mode, max_bytes, note: importNote});
+  if(out) out.textContent = `已带入 ${selected.length} 条到“新增/修改受控文件”，确认后点保存`;
+}
 
 function setChangelogEditor(version){
   const sel = document.getElementById("dCatalogVersion");
@@ -778,7 +1044,12 @@ function renderStatusTable(){
     const snap = row.latest_snapshot || null;
     const expected = base ? base.expected_main_version : "";
     const observed = snap ? (snap.main_version || "") : "";
-    const err = snap ? (snap.error || "") : "";
+    const cfc = row.controlled_files_change || null;
+    const cfcPayload = cfc ? (cfc.payload || {}) : {};
+    const cfcChanges = Array.isArray(cfcPayload.changes) ? cfcPayload.changes : [];
+    const cfcPaths = cfcChanges.map(x => String((x && x.path) || "")).filter(Boolean);
+    const cfcSummary = cfcPaths.length ? cfcPaths.slice(0,3).join(", ") + (cfcPaths.length > 3 ? ` 等${cfcPaths.length}个` : "") : (cfc ? (cfc.message || "文件变更") : "");
+    const err = (row.state === "files_changed") ? cfcSummary : (snap ? (snap.error || "") : "");
     const canSetBaseline = Boolean(observed) && !["offline","never_polled","unknown"].includes(String(row.state || ""));
     const tr = document.createElement("tr");
     tr.className = row.state;
@@ -804,9 +1075,13 @@ function renderStatusTable(){
 
 function renderKpi(counts){
   const el = document.getElementById("kpi");
-  const mk = (label, value) => `<div class="box ${filterState === label ? "active" : ""}" data-state="${label}"><div class="n">${value||0}</div><div class="l">${label}</div></div>`;
+  const labelOf = (label) => ({
+    "files_changed": "文件变更",
+  })[String(label || "")] || label;
+  const mk = (label, value) => `<div class="box ${filterState === label ? "active" : ""}" data-state="${label}"><div class="n">${value||0}</div><div class="l">${labelOf(label)}</div></div>`;
   el.innerHTML = [
     mk("ok", counts.ok),
+    mk("files_changed", counts.files_changed),
     mk("mismatch", counts.mismatch),
     mk("offline", counts.offline),
     mk("no_baseline", counts.no_baseline),
@@ -880,13 +1155,103 @@ async function deleteDevice(id) {
   await apiFetch(`/api/v1/devices/${id}`, { method: "DELETE" });
 }
 
+function renderLastControlledFileChangeEvent(ev){
+  const metaEl = document.getElementById("dCfrChgMeta");
+  const tbody = document.getElementById("dCfrChgRows");
+  const diffEl = document.getElementById("dCfrChgDiff");
+  if(metaEl) metaEl.textContent = "";
+  if(tbody) tbody.innerHTML = "";
+  if(diffEl) diffEl.textContent = "";
+  if(!ev){
+    if(metaEl) metaEl.textContent = "暂无变更事件";
+    return;
+  }
+  if(metaEl) metaEl.textContent = `${fmt(ev.created_at)} ${fmt(ev.message)}`;
+  const payload = ev.payload || {};
+  const changes = Array.isArray(payload.changes) ? payload.changes : [];
+  if(!changes.length){
+    if(metaEl) metaEl.textContent = `${fmt(ev.created_at)}（无 changes 详情）`;
+    return;
+  }
+  for(const ch of changes){
+    const path = String(ch.path || "");
+    const oldFp = ch.old === null || ch.old === undefined ? "" : String(ch.old);
+    const newFp = ch.new === null || ch.new === undefined ? "" : String(ch.new);
+    const hasDiff = Boolean(ch.diff_unified);
+    const btn = hasDiff ? `<button class="btn ghost" data-act="show_diff" data-path="${esc(path)}">查看</button>` : "—";
+    const tr = document.createElement("tr");
+    tr.setAttribute("data-chg", JSON.stringify(ch));
+    tr.innerHTML = `
+      <td class="mono">${esc(path)}</td>
+      <td class="mono">${esc(oldFp)}</td>
+      <td class="mono">${esc(newFp)}</td>
+      <td>${btn}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+  tbody.onclick = (e) => {
+    const b = e.target.closest("button");
+    if(!b) return;
+    if(b.getAttribute("data-act") !== "show_diff") return;
+    const tr = b.closest("tr");
+    if(!tr) return;
+    const raw = tr.getAttribute("data-chg");
+    if(!raw) return;
+    let ch = null;
+    try { ch = JSON.parse(raw); } catch { ch = null; }
+    const diff = ch && ch.diff_unified ? String(ch.diff_unified) : "";
+    if(diffEl) diffEl.textContent = diff || "无 diff（可能 max_bytes=0 或未获取到内容）";
+  };
+}
+
+async function loadLastControlledFileChangeEvent(deviceId){
+  try{
+    const res = await apiFetch(`/api/v1/events?limit=50&device_id=${encodeURIComponent(deviceId)}`);
+    const data = await res.json();
+    const items = Array.isArray(data.items) ? data.items : [];
+    const ev = items.find(x => x && x.event_type === "controlled_files_change") || null;
+    renderLastControlledFileChangeEvent(ev);
+  }catch{
+    renderLastControlledFileChangeEvent(null);
+  }
+}
+
+async function ackControlledFilesChange(){
+  const out = document.getElementById("dCfrAckOut");
+  if(out) out.textContent = "";
+  const id = currentDetailId;
+  if(!id){ if(out) out.textContent = "missing_device_id"; return; }
+  try{
+    const res = await apiFetch(`/api/v1/devices/${encodeURIComponent(id)}/ack-controlled-files`, { method:"POST", headers: {"Content-Type":"application/json"}, body: "{}" });
+    const data = await res.json();
+    if(!res.ok){ if(out) out.textContent = data.error || "failed"; return; }
+    if(out) out.textContent = "ok";
+    await load();
+    await loadLastControlledFileChangeEvent(id);
+  }catch(e){
+    if(out) out.textContent = String(e || "failed");
+  }
+}
+
 async function openDeviceDlg(id){
   currentDetailId = id;
+  currentDetailClusterId = null;
   currentDetailSupplier = null;
   currentDetailDeviceType = null;
   currentObservedCatalog = null;
+  currentDetailCfrRule = null;
+  currentDetailReportedFiles = [];
   document.getElementById("dOut").textContent = "";
   document.getElementById("dRaw").textContent = "";
+  document.getElementById("dCfrRule").textContent = "";
+  document.getElementById("dCfrNote").textContent = "";
+  document.getElementById("dCfrHint").textContent = "";
+  document.getElementById("dCfrRows").innerHTML = "";
+  document.getElementById("dCfrImportOut").textContent = "";
+  document.getElementById("dCfrChgMeta").textContent = "";
+  document.getElementById("dCfrChgRows").innerHTML = "";
+  document.getElementById("dCfrChgDiff").textContent = "";
+  document.getElementById("dCfrAckOut").textContent = "";
   document.getElementById("dChangelogMd").value = "";
   document.getElementById("dChangelogOut").textContent = "";
   document.getElementById("dHistRows").innerHTML = "";
@@ -899,6 +1264,7 @@ async function openDeviceDlg(id){
   const base = data.baseline || null;
   const snap = data.latest_snapshot || null;
   currentObservedCatalog = data.observed_version_catalog || null;
+  currentDetailClusterId = dev.cluster_id || null;
   currentDetailSupplier = dev.supplier || "";
   currentDetailDeviceType = dev.device_type || "";
   document.getElementById("dTitle").textContent = `${dev.device_serial || ""} (#${dev.id || ""})`;
@@ -917,6 +1283,8 @@ async function openDeviceDlg(id){
   document.getElementById("dErr").textContent = snap ? (snap.error || "") : "";
   const raw = snap && snap.payload ? snap.payload : null;
   document.getElementById("dRaw").textContent = raw ? JSON.stringify(raw, null, 2) : "";
+  renderControlledFiles(data.controlled_file_rule || null, raw);
+  await loadLastControlledFileChangeEvent(id);
   await loadDeviceVersionHistory(id, snap ? (snap.main_version || "") : "");
 }
 
@@ -1073,7 +1441,8 @@ function openCfrDlg(r){
   const dlg = document.getElementById("cfrDlg");
   dlg.setAttribute("data-cfr-id", r ? String(r.id || "") : "");
   document.getElementById("cfrDlgOut").textContent = "";
-  document.getElementById("cfrCluster").value = document.getElementById("clusterSelect").value;
+  const clusterId = (r && r.cluster_id !== null && r.cluster_id !== undefined) ? String(r.cluster_id) : document.getElementById("clusterSelect").value;
+  document.getElementById("cfrCluster").value = clusterId;
   document.getElementById("cfrVendor").value = r ? (r.supplier || "") : "";
   document.getElementById("cfrModel").value = r ? (r.device_type || "") : "";
   document.getElementById("cfrPaths").value = r ? ((r.paths || []).join(", ")) : "";
@@ -1150,8 +1519,17 @@ async function logout(){
 
 async function pollAll() {
   document.getElementById("pollAll").disabled = true;
+  const out = document.getElementById("pollOut");
+  if(out) out.textContent = "拉取中...";
   try {
-    await fetch("/api/v1/poll", { method:"POST", headers: {"Content-Type":"application/json"}, body: "{}" });
+    const res = await apiFetch("/api/v1/poll", { method:"POST", headers: {"Content-Type":"application/json"}, body: "{}" });
+    let data = {};
+    try { data = await res.json(); } catch {}
+    if(!res.ok){
+      if(out) out.textContent = (data && data.error) ? data.error : `failed:${res.status}`;
+      return;
+    }
+    if(out) out.textContent = `ok:${fmt(data.ok)} fail:${fmt(data.fail)}`;
   } finally {
     document.getElementById("pollAll").disabled = false;
     await load();
@@ -1176,6 +1554,11 @@ document.getElementById("deviceCancel").addEventListener("click", () => document
 document.getElementById("deviceSave").addEventListener("click", saveDeviceDetail);
 document.getElementById("dCatalogVersion").addEventListener("change", () => setChangelogEditor());
 document.getElementById("dSaveChangelog").addEventListener("click", saveChangelog);
+document.getElementById("dCfrSelAll").addEventListener("click", () => _setCfrAll(true));
+document.getElementById("dCfrSelNone").addEventListener("click", () => _setCfrAll(false));
+document.getElementById("dCfrSelMatched").addEventListener("click", () => _setCfrMatchedOnly());
+document.getElementById("dCfrImport").addEventListener("click", () => importCfrFromDeviceSelection());
+document.getElementById("dCfrAck").addEventListener("click", () => ackControlledFilesChange());
 document.getElementById("filterState").addEventListener("change", () => renderStatusTable());
 document.getElementById("filterQuery").addEventListener("input", () => renderStatusTable());
 document.getElementById("clearFilters").addEventListener("click", () => {
@@ -1585,9 +1968,9 @@ class App:
         poll_result: Any,
         prev_success_snapshot: Optional[Dict[str, Any]],
         current_snapshot_id: int,
-    ) -> None:
+    ) -> List[Dict[str, Any]]:
         if not getattr(poll_result, "success", False):
-            return
+            return []
         rule = self.db.get_controlled_file_rule(
             cluster_id=int(device["cluster_id"]),
             vendor=str(device["vendor"]),
@@ -1595,7 +1978,7 @@ class App:
         )
         patterns = (rule or {}).get("paths") or []
         if not patterns:
-            return
+            return []
         mode = str((rule or {}).get("mode") or "auto").strip().lower() or "auto"
         if mode not in ("auto", "inline", "fetch"):
             mode = "auto"
@@ -1608,14 +1991,14 @@ class App:
 
         curr_entries, curr_supported = self._extract_reported_file_entries(getattr(poll_result, "payload", None))
         if not curr_supported:
-            return
+            return []
         prev_payload = prev_success_snapshot.get("payload") if prev_success_snapshot else None
         prev_entries, prev_supported = self._extract_reported_file_entries(prev_payload)
 
         curr_sel = self._select_controlled_files(curr_entries, patterns)
         prev_sel = self._select_controlled_files(prev_entries, patterns) if prev_supported else {}
         if not curr_sel and not prev_sel:
-            return
+            return []
 
         timeout_s = getattr(poll_result, "latency_ms", None)
         try:
@@ -1640,7 +2023,7 @@ class App:
 
         # first time supporting files => just establish baseline, no event
         if not prev_supported:
-            return
+            return []
 
         changes: List[Dict[str, Any]] = []
         for path in sorted(set(prev_sel.keys()) | set(curr_sel.keys())):
@@ -1649,7 +2032,7 @@ class App:
             if old_fp != new_fp:
                 changes.append({"path": path, "old": old_fp, "new": new_fp})
         if not changes:
-            return
+            return []
 
         # enrich with optional content + diff
         for ch in changes:
@@ -1727,12 +2110,16 @@ class App:
                 except Exception:
                     pass
 
+        paths_changed = [str(x.get("path") or "") for x in changes if str(x.get("path") or "").strip()]
+        short = ", ".join(paths_changed[:3])
+        more = f" 等{len(paths_changed)}个文件" if len(paths_changed) > 3 else ""
+        msg = f"受控文件变更: {short}{more}".strip()
         event_id = self.db.create_event(
             device_id=int(device["id"]),
             event_type="controlled_files_change",
             old_state=None,
             new_state=None,
-            message=f"controlled_files_change changed={len(changes)}",
+            message=msg,
             payload={
                 "device_id": int(device["id"]),
                 "device_serial": device.get("device_key"),
@@ -1755,6 +2142,7 @@ class App:
                 "timestamp": _utc_now_iso(),
             }
         )
+        return changes
 
     def poll_and_record(self, device: Dict[str, Any], *, timeout_s: float = 2.0) -> Dict[str, Any]:
         device_id = int(device["id"])
@@ -1784,8 +2172,20 @@ class App:
                 )
             except Exception:
                 pass
+        controlled_changes: List[Dict[str, Any]] = []
+        try:
+            controlled_changes = self._check_controlled_files(
+                device=device,
+                poll_result=res,
+                prev_success_snapshot=prev,
+                current_snapshot_id=snapshot_id,
+            )
+        except Exception:
+            controlled_changes = []
         old_state = device.get("last_state")
-        new_state, message = self._compute_state_and_message(device=device, poll_result=res)
+        new_state, message = self._compute_state_and_message(
+            device=device, poll_result=res, controlled_changes=controlled_changes
+        )
         if new_state:
             self.db.update_device_state(device_id, new_state)
         if new_state and (old_state != new_state):
@@ -1803,10 +2203,11 @@ class App:
                     "ip": device.get("ip"),
                     "port": device.get("port"),
                     "observed_main_version": res.main_version,
-                    "http_status": res.http_status,
-                    "error": res.error,
-                },
-            )
+                        "http_status": res.http_status,
+                        "error": res.error,
+                        "controlled_files_changed": len(controlled_changes),
+                    },
+                )
             self._notify_webhook(
                 {
                     "event_id": event_id,
@@ -1855,15 +2256,6 @@ class App:
                         "timestamp": _utc_now_iso(),
                     }
                 )
-        try:
-            self._check_controlled_files(
-                device=device,
-                poll_result=res,
-                prev_success_snapshot=prev,
-                current_snapshot_id=snapshot_id,
-            )
-        except Exception:
-            pass
         return {
             "device_id": device_id,
             "snapshot_id": snapshot_id,
@@ -1874,7 +2266,13 @@ class App:
             "main_version": res.main_version,
         }
 
-    def _compute_state_and_message(self, *, device: Dict[str, Any], poll_result: Any) -> tuple[Optional[str], Optional[str]]:
+    def _compute_state_and_message(
+        self,
+        *,
+        device: Dict[str, Any],
+        poll_result: Any,
+        controlled_changes: Optional[List[Dict[str, Any]]] = None,
+    ) -> tuple[Optional[str], Optional[str]]:
         if not getattr(poll_result, "success", False):
             return "offline", str(getattr(poll_result, "error", None) or "offline")
         baseline = self.db.get_baseline(
@@ -1886,6 +2284,13 @@ class App:
         if baseline is None:
             return "no_baseline", "no_baseline"
         if self.db.baseline_allows(baseline, observed):
+            chg = controlled_changes or []
+            if chg:
+                n = len(chg)
+                paths = [str(x.get("path") or "") for x in chg if str(x.get("path") or "").strip()]
+                short = ", ".join(paths[:3])
+                more = f" 等{n}个文件" if n > 3 else ""
+                return "files_changed", f"files_changed {short}{more}"
             return "ok", f"ok observed={observed}"
         expected = str(baseline.get("expected_main_version") or "")
         return "mismatch", f"mismatch expected={expected} observed={observed}"
@@ -2449,6 +2854,49 @@ class VersionManagerHandler(BaseHTTPRequestHandler):
             except Exception as e:  # noqa: BLE001
                 return _send_json(self, 409, {"error": f"create_device_failed:{e}"})
             return _send_json(self, 201, {"id": device_id})
+
+        if parts[:3] == ["api", "v1", "devices"] and len(parts) == 5 and parts[4] == "ack-controlled-files":
+            if not self._require_admin():
+                return
+            try:
+                device_id = int(parts[3])
+            except ValueError:
+                return _send_json(self, 400, {"error": "invalid_device_id"})
+            if not self.app.db.get_device(device_id):
+                return _send_json(self, 404, {"error": "not_found"})
+            change_id = None
+            try:
+                rows = self.app.db._query(  # type: ignore[attr-defined]
+                    """
+                    SELECT id
+                    FROM events
+                    WHERE device_id = ? AND event_type = 'controlled_files_change'
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (int(device_id),),
+                )
+                if rows:
+                    change_id = int(rows[0]["id"])
+            except Exception:
+                change_id = None
+            try:
+                self.app.db.create_event(
+                    device_id=device_id,
+                    event_type="controlled_files_ack",
+                    old_state=None,
+                    new_state=None,
+                    message="已确认受控文件变更",
+                    payload={"device_id": device_id, "ack_change_event_id": change_id},
+                )
+            except Exception:
+                pass
+            # Clear sticky indicator; status still uses snapshot/baseline priority.
+            try:
+                self.app.db.update_device_state(device_id, "ok")
+            except Exception:
+                pass
+            return _send_json(self, 200, {"ok": True, "ack_change_event_id": change_id})
 
         if parts[:3] == ["api", "v1", "baselines"] and len(parts) == 3:
             if not self._require_admin():

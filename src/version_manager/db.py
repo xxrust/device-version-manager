@@ -1014,12 +1014,69 @@ class Database:
             else:
                 observed = str(snap["main_version"] or "")
                 state = "ok" if self.baseline_allows(baseline, observed) else "mismatch"
+
+            controlled_files_change = None
+            # If baseline is ok, show "files_changed" when there is an un-acked change event.
+            if state == "ok":
+                try:
+                    last_change = self._query(
+                        """
+                        SELECT id, created_at, message, payload_json
+                        FROM events
+                        WHERE device_id = ? AND event_type = 'controlled_files_change'
+                        ORDER BY created_at DESC, id DESC
+                        LIMIT 1
+                        """,
+                        (int(dev["id"]),),
+                    )
+                    last_ack = self._query(
+                        """
+                        SELECT id, payload_json
+                        FROM events
+                        WHERE device_id = ? AND event_type = 'controlled_files_ack'
+                        ORDER BY created_at DESC, id DESC
+                        LIMIT 1
+                        """,
+                        (int(dev["id"]),),
+                    )
+                    if last_change:
+                        change = dict(last_change[0])
+                        change_id = int(change.get("id") or 0)
+                        ack_change_id = None
+                        if last_ack:
+                            try:
+                                ack = dict(last_ack[0])
+                                raw = ack.get("payload_json")
+                                if raw:
+                                    payload = json.loads(raw)
+                                    if isinstance(payload, dict) and payload.get("ack_change_event_id") is not None:
+                                        ack_change_id = int(payload.get("ack_change_event_id"))
+                            except Exception:
+                                ack_change_id = None
+                        # If ack payload is missing/invalid, treat as not acked.
+                        if ack_change_id is None or ack_change_id < change_id:
+                            state = "files_changed"
+                            payload = None
+                            if change.get("payload_json"):
+                                try:
+                                    payload = json.loads(change["payload_json"])
+                                except json.JSONDecodeError:
+                                    payload = None
+                            controlled_files_change = {
+                                "id": change.get("id"),
+                                "created_at": change.get("created_at"),
+                                "message": change.get("message"),
+                                "payload": payload,
+                            }
+                except Exception:
+                    controlled_files_change = None
             out.append(
                 {
                     "device": dev,
                     "baseline": baseline,
                     "latest_snapshot": snap,
                     "state": state,
+                    "controlled_files_change": controlled_files_change,
                 }
             )
         return out
