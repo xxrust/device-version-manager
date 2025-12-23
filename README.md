@@ -37,7 +37,7 @@
 
 ### 0) （可选）构建 Vue3 前端
 
-默认情况下，服务会在检测到 `web/dist` 存在时把它作为前端（`/`），旧版纯 HTML Dashboard 保留在 `/legacy`。
+默认情况下，服务会在检测到 `web/dist` 存在时把它作为前端（`/`）。如果未构建前端，会在访问 `/` 时提示“前端未构建”。
 
 ```powershell
 cd version_manage
@@ -56,7 +56,6 @@ python -m src.version_manager.server --host 0.0.0.0 --port 8080 --db .\data\vm.s
 2) 打开：
 
 - Dashboard（Vue3，如果已构建）：`http://localhost:8080/`
-- Dashboard（旧版 HTML）：`http://localhost:8080/legacy`
 - API：`http://localhost:8080/api/v1/...`
 
 3) 首次使用：访问 `http://127.0.0.1:8080/setup` 创建管理员，然后到 `http://127.0.0.1:8080/login` 登录。

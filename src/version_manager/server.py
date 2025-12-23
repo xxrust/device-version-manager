@@ -39,6 +39,32 @@ def _read_json(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
         raise ValueError(f"invalid_json:{e}") from e
 
 
+def _frontend_missing_html() -> str:
+    return """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>设备版本管理器</title>
+  <style>
+    body{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 24px; background:#f6f7fb; color:#1b2430; }
+    .card{ max-width: 920px; margin: 0 auto; background:#fff; border:1px solid rgba(16,24,40,.10); border-radius: 12px; padding: 18px; }
+    code, pre{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, \"Liberation Mono\", \"Courier New\", monospace; }
+    .muted{ color:#5a677a; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1 style="margin:0 0 8px 0; font-size:18px;">前端未构建</h1>
+    <div class="muted" style="line-height:1.6;">
+      当前服务未找到 Vue 前端构建产物（dist），旧版界面已移除。<br/>
+      请在 <code>web/</code> 目录执行 <code>npm install</code> 与 <code>npm run build</code>，然后启动服务并指定 <code>--frontend-dist</code> 指向构建目录。
+    </div>
+  </div>
+</body>
+</html>"""
+
+
 def _get_body_str(body: Dict[str, Any], *keys: str) -> str:
     for k in keys:
         v = body.get(k)
@@ -1359,6 +1385,8 @@ async function deleteDevice(id) {
   await apiFetch(`/api/v1/devices/${id}`, { method: "DELETE" });
 }
 
+let lastControlledFilesChangeEv = null;
+
 function renderLastControlledFileChangeEvent(ev){
   const metaEl = document.getElementById("dCfrChgMeta");
   const tbody = document.getElementById("dCfrChgRows");
@@ -1366,6 +1394,7 @@ function renderLastControlledFileChangeEvent(ev){
   if(metaEl) metaEl.textContent = "";
   if(tbody) tbody.innerHTML = "";
   if(diffEl) diffEl.textContent = "";
+  lastControlledFilesChangeEv = ev || null;
   if(!ev){
     if(metaEl) metaEl.textContent = "暂无变更事件";
     return;
@@ -1425,8 +1454,15 @@ async function ackControlledFilesChange(){
   if(out) out.textContent = "";
   const id = currentDetailId;
   if(!id){ if(out) out.textContent = "missing_device_id"; return; }
+  const note = window.prompt("确认本次受控文件变更（可填写说明，取消则不执行）", "");
+  if(note === null) return;
   try{
-    const res = await apiFetch(`/api/v1/devices/${encodeURIComponent(id)}/ack-controlled-files`, { method:"POST", headers: {"Content-Type":"application/json"}, body: "{}" });
+    const ackId = lastControlledFilesChangeEv && lastControlledFilesChangeEv.id ? lastControlledFilesChangeEv.id : null;
+    const res = await apiFetch(`/api/v1/devices/${encodeURIComponent(id)}/ack-controlled-files`, {
+      method:"POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ ack_change_event_id: ackId, note: String(note || "") }),
+    });
     const data = await res.json();
     if(!res.ok){ if(out) out.textContent = data.error || "failed"; return; }
     if(out) out.textContent = "ok";
@@ -2687,14 +2723,14 @@ class VersionManagerHandler(BaseHTTPRequestHandler):
         if parsed.path == "/legacy":
             if not self._auth():
                 return _redirect(self, "/login")
-            return _send_html(self, 200, _dashboard_html())
+            return _redirect(self, "/")
 
         if parsed.path == "/":
             if not self._auth():
                 return _redirect(self, "/login")
             if self._try_serve_frontend(parsed.path):
                 return
-            return _send_html(self, 200, _dashboard_html())
+            return _send_html(self, 200, _frontend_missing_html())
 
         # Serve Vue frontend static assets / SPA routes (when built dist exists).
         if not parsed.path.startswith("/api/") and self.app.frontend_dist:
@@ -3254,7 +3290,8 @@ class VersionManagerHandler(BaseHTTPRequestHandler):
             return _send_json(self, 201, {"id": device_id})
 
         if parts[:3] == ["api", "v1", "devices"] and len(parts) == 5 and parts[4] == "ack-controlled-files":
-            if not self._require_admin():
+            u = self._require_admin()
+            if not u:
                 return
             try:
                 device_id = int(parts[3])
@@ -3262,6 +3299,25 @@ class VersionManagerHandler(BaseHTTPRequestHandler):
                 return _send_json(self, 400, {"error": "invalid_device_id"})
             if not self.app.db.get_device(device_id):
                 return _send_json(self, 404, {"error": "not_found"})
+
+            try:
+                body = _read_json(self)
+            except ValueError as e:
+                return _send_json(self, 400, {"error": str(e)})
+            requested_ack_id = body.get("ack_change_event_id")
+            if requested_ack_id is None:
+                requested_ack_id = body.get("change_event_id")
+            if requested_ack_id is None:
+                requested_ack_id = body.get("change_id")
+            try:
+                requested_ack_id_int = int(requested_ack_id) if requested_ack_id is not None else None
+            except Exception:
+                return _send_json(self, 400, {"error": "invalid_ack_change_event_id"})
+
+            note = str(body.get("note") or body.get("reason") or "").strip()
+            if len(note) > 2000:
+                note = note[:2000]
+
             change_id = None
             try:
                 rows = self.app.db._query(  # type: ignore[attr-defined]
@@ -3278,6 +3334,18 @@ class VersionManagerHandler(BaseHTTPRequestHandler):
                     change_id = int(rows[0]["id"])
             except Exception:
                 change_id = None
+            if change_id is None:
+                return _send_json(self, 409, {"error": "no_controlled_files_change_event"})
+            if requested_ack_id_int is not None and requested_ack_id_int != change_id:
+                return _send_json(
+                    self,
+                    409,
+                    {
+                        "error": "stale_ack_change_event_id",
+                        "requested": requested_ack_id_int,
+                        "latest": change_id,
+                    },
+                )
             try:
                 self.app.db.create_event(
                     device_id=device_id,
@@ -3285,7 +3353,13 @@ class VersionManagerHandler(BaseHTTPRequestHandler):
                     old_state=None,
                     new_state=None,
                     message="已确认受控文件变更",
-                    payload={"device_id": device_id, "ack_change_event_id": change_id},
+                    payload={
+                        "device_id": device_id,
+                        "ack_change_event_id": change_id,
+                        "reviewed_by": str(u.get("username") or ""),
+                        "review_note": note,
+                        "reviewed_at": _utc_now_iso(),
+                    },
                 )
             except Exception:
                 pass
@@ -3294,7 +3368,11 @@ class VersionManagerHandler(BaseHTTPRequestHandler):
                 self.app.db.update_device_state(device_id, "ok")
             except Exception:
                 pass
-            return _send_json(self, 200, {"ok": True, "ack_change_event_id": change_id})
+            return _send_json(
+                self,
+                200,
+                {"ok": True, "ack_change_event_id": change_id, "reviewed_by": str(u.get("username") or "")},
+            )
 
         if parts[:3] == ["api", "v1", "baselines"] and len(parts) == 3:
             if not self._require_admin():

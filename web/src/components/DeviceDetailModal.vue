@@ -3,6 +3,15 @@ import { computed, onMounted, ref, watch } from "vue";
 import { apiJson, jsonBody } from "../api";
 import type { DeviceDetailResponse, DeviceDocsItem, DeviceDocsResponse, VersionHistoryItem } from "../types";
 
+type EventItem = {
+  id: number;
+  device_id: number;
+  created_at: string;
+  event_type: string;
+  message?: string | null;
+  payload?: any;
+};
+
 const props = defineProps<{
   deviceId: number;
 }>();
@@ -17,6 +26,8 @@ const error = ref<string | null>(null);
 const detail = ref<DeviceDetailResponse | null>(null);
 const docs = ref<DeviceDocsResponse | null>(null);
 const history = ref<VersionHistoryItem[]>([]);
+const events = ref<EventItem[]>([]);
+const eventsError = ref<string | null>(null);
 
 const selectedVersion = ref<string>("");
 const managerNote = ref<string>("");
@@ -31,6 +42,13 @@ const aiMaxTokens = ref<number>(1200);
 const aiRunning = ref<boolean>(false);
 const aiError = ref<string | null>(null);
 const aiResult = ref<any>(null);
+
+const cfcSelectedDiff = ref<string>("点击左侧“查看明细”查看 diff");
+const cfcAckNote = ref<string>("");
+const cfcAckRunning = ref<boolean>(false);
+const cfcAckError = ref<string | null>(null);
+const cfcAckOk = ref<string | null>(null);
+const cfcAnchor = ref<HTMLElement | null>(null);
 
 const selectedHistoryItem = computed(() => history.value.find((x) => x.main_version === selectedVersion.value) || null);
 
@@ -60,6 +78,67 @@ const selectedDoc = computed<DeviceDocsItem | null>(() => {
   return items.find((x) => x.name === docName.value) || null;
 });
 
+const lastControlledFilesChange = computed<EventItem | null>(() => {
+  return events.value.find((x) => x && x.event_type === "controlled_files_change") || null;
+});
+
+const lastControlledFilesAck = computed<EventItem | null>(() => {
+  return events.value.find((x) => x && x.event_type === "controlled_files_ack") || null;
+});
+
+const controlledFileChanges = computed<any[]>(() => {
+  const ev = lastControlledFilesChange.value;
+  const payload = (ev && ev.payload) || {};
+  const changes = Array.isArray(payload.changes) ? payload.changes : [];
+  return changes;
+});
+
+const cfcIsUnacked = computed<boolean>(() => {
+  const changeEv = lastControlledFilesChange.value;
+  if (!changeEv) return false;
+  const ackEv = lastControlledFilesAck.value;
+  if (!ackEv) return true;
+  const payload = ackEv.payload || {};
+  const ackIdRaw = payload.ack_change_event_id;
+  const ackId =
+    ackIdRaw === null || ackIdRaw === undefined || ackIdRaw === "" ? null : Number(String(ackIdRaw).trim());
+  const changeId = Number(String(changeEv.id).trim());
+  if (!Number.isFinite(changeId)) return true;
+  if (ackId === null || !Number.isFinite(ackId)) return true;
+  return ackId < changeId;
+});
+
+function controlledFilesAckMeta(): string {
+  const ev = lastControlledFilesAck.value;
+  if (!ev) return "";
+  const payload = ev.payload || {};
+  const by = String(payload.reviewed_by || "").trim();
+  const at = String(payload.reviewed_at || "").trim();
+  const note = String(payload.review_note || "").trim();
+  const parts: string[] = [];
+  if (by) parts.push(`by=${by}`);
+  if (at) parts.push(`at=${at}`);
+  if (note) parts.push(`note=${note}`);
+  return parts.join(" | ");
+}
+
+async function loadEvents() {
+  eventsError.value = null;
+  try {
+    const r = await apiJson<{ items: EventItem[] }>(`/api/v1/events?limit=50&device_id=${props.deviceId}`);
+    events.value = r.items || [];
+    const last = events.value.find((x) => x && x.event_type === "controlled_files_change") || null;
+    const payload = (last && last.payload) || {};
+    const changes = Array.isArray(payload.changes) ? payload.changes : [];
+    if (changes.length && (!cfcSelectedDiff.value || cfcSelectedDiff.value.startsWith("点击左侧"))) {
+      showCfcDiff(changes[0]);
+    }
+  } catch (e: any) {
+    events.value = [];
+    eventsError.value = String(e?.message || e || "events_load_failed");
+  }
+}
+
 async function loadAll() {
   loading.value = true;
   error.value = null;
@@ -73,6 +152,8 @@ async function loadAll() {
 
     const dr = await apiJson<DeviceDocsResponse>(`/api/v1/devices/${props.deviceId}/docs`);
     docs.value = dr;
+
+    await loadEvents();
 
     const versions = (history.value || []).map((x) => x.main_version).filter(Boolean);
     if (observedVersion.value && !versions.includes(observedVersion.value)) versions.unshift(observedVersion.value);
@@ -178,6 +259,48 @@ async function runAiAnalysis() {
   }
 }
 
+function showCfcDiff(ch: any) {
+  const diff = ch && ch.diff_unified ? String(ch.diff_unified) : "";
+  cfcSelectedDiff.value = diff || "无 diff（可能 max_bytes=0 或未获取到内容）";
+}
+
+async function ackControlledFilesChange() {
+  const ev = lastControlledFilesChange.value;
+  if (!ev) return;
+  if (!cfcIsUnacked.value) return;
+  cfcAckOk.value = null;
+  cfcAckError.value = null;
+  const note = cfcAckNote.value.trim();
+  if (note.length < 3) {
+    cfcAckError.value = "请填写确认说明（至少 3 个字符）";
+    return;
+  }
+  if (!confirm(`确认本次受控文件变更并清除 files_changed 提示？\n\n事件：${ev.created_at} ${ev.message || ""}`.trim())) return;
+  cfcAckRunning.value = true;
+  try {
+    await apiJson(`/api/v1/devices/${props.deviceId}/ack-controlled-files`, {
+      method: "POST",
+      ...jsonBody({ ack_change_event_id: ev.id, note }),
+    });
+    cfcAckOk.value = "ok";
+    cfcAckNote.value = "";
+    emit("updated");
+    await loadAll();
+  } catch (e: any) {
+    cfcAckError.value = String(e?.message || e || "ack_failed");
+  } finally {
+    cfcAckRunning.value = false;
+  }
+}
+
+function jumpToControlledFiles() {
+  try {
+    cfcAnchor.value?.scrollIntoView({ behavior: "smooth", block: "start" });
+  } catch {
+    cfcAnchor.value?.scrollIntoView();
+  }
+}
+
 onMounted(loadAll);
 </script>
 
@@ -218,6 +341,7 @@ onMounted(loadAll);
                 <div class="sectionTitle">设备信息</div>
                 <div class="row">
                   <button class="btn" @click="pollDevice">轮询</button>
+                  <button class="btn" v-if="lastControlledFilesChange" @click="jumpToControlledFiles">查看文件变更</button>
                   <button class="btn" @click="setBaselineToObserved" :disabled="!detail.latest_snapshot?.main_version">
                     设置基线 = 当前版本
                   </button>
@@ -294,6 +418,83 @@ onMounted(loadAll);
             </div>
           </div>
 
+          <div class="card" ref="cfcAnchor">
+            <div style="padding: 12px">
+              <div class="row" style="justify-content: space-between">
+                <div class="sectionTitle">受控文件变更（files_changed）</div>
+                <div class="row">
+                  <span class="pill" v-if="cfcIsUnacked" style="border-color: rgba(237, 108, 2, 0.22); color: var(--warn)"
+                    >未确认</span
+                  >
+                  <button class="btn" @click="loadEvents">刷新</button>
+                </div>
+              </div>
+              <div class="muted" style="font-size: 12px; margin-top: 8px" v-if="eventsError">Error: {{ eventsError }}</div>
+              <template v-else-if="lastControlledFilesChange">
+                <div class="muted" style="font-size: 12px; margin-top: 8px">
+                  <span class="mono">{{ lastControlledFilesChange.created_at }}</span>
+                  <span v-if="lastControlledFilesChange.message"> · {{ lastControlledFilesChange.message }}</span>
+                </div>
+                <div class="muted" style="font-size: 12px; margin-top: 6px" v-if="lastControlledFilesAck">
+                  已确认：<span class="mono">{{ controlledFilesAckMeta() }}</span>
+                </div>
+
+                <div class="row" style="margin-top: 10px; align-items: flex-start">
+                  <div style="flex: 1">
+                    <table style="width: 100%">
+                      <thead>
+                        <tr>
+                          <th style="text-align: left">path</th>
+                          <th style="text-align: left">old</th>
+                          <th style="text-align: left">new</th>
+                          <th style="width: 90px">diff</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr v-for="(ch, idx) in controlledFileChanges" :key="idx">
+                          <td class="mono">{{ String(ch.path || "") }}</td>
+                          <td class="mono">{{ ch.old === null || ch.old === undefined ? "" : String(ch.old) }}</td>
+                          <td class="mono">{{ ch.new === null || ch.new === undefined ? "" : String(ch.new) }}</td>
+                          <td style="text-align: center">
+                            <button class="btn ghost" @click="showCfcDiff(ch)">查看明细</button>
+                          </td>
+                        </tr>
+                        <tr v-if="!controlledFileChanges.length">
+                          <td class="muted" colspan="4">(无 changes 详情)</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                  <div style="flex: 1; min-width: 320px">
+                    <div class="pre" style="min-height: 120px">{{ cfcSelectedDiff }}</div>
+                  </div>
+                </div>
+
+                <div class="row" style="margin-top: 10px; align-items: flex-start" v-if="cfcIsUnacked">
+                  <div style="flex: 1">
+                    <div class="muted" style="font-size: 12px">确认说明（会写入审计日志）</div>
+                    <textarea
+                      class="textarea mono"
+                      v-model="cfcAckNote"
+                      rows="3"
+                      style="width: 100%; margin-top: 6px"
+                      placeholder="例如：已核对 diff，为预期配置变更 / 已按变更单 #123 执行"
+                    />
+                    <div class="muted" style="font-size: 12px; margin-top: 6px" v-if="cfcAckError">Error: {{ cfcAckError }}</div>
+                    <div class="muted" style="font-size: 12px; margin-top: 6px" v-else-if="cfcAckOk">ack={{ cfcAckOk }}</div>
+                  </div>
+                  <div class="row" style="margin-top: 18px">
+                    <button class="btn primary" @click="ackControlledFilesChange" :disabled="cfcAckRunning">
+                      确认变更（清除提示）
+                    </button>
+                  </div>
+                </div>
+                <div class="muted" style="font-size: 12px; margin-top: 10px" v-else>已确认，无需操作。</div>
+              </template>
+              <div class="muted" style="font-size: 12px; margin-top: 8px" v-else>暂无受控文件变更事件</div>
+            </div>
+          </div>
+
           <div class="card">
             <div style="padding: 12px">
               <div class="sectionTitle">AI 分析（LangGraph）</div>
@@ -316,7 +517,7 @@ onMounted(loadAll);
                   v-model.number="aiMaxTokens"
                   min="256"
                   max="8192"
-                  step="256"
+                  step="1"
                   style="width: 110px"
                 />
                 <button class="btn primary" @click="runAiAnalysis" :disabled="aiRunning">运行分析</button>

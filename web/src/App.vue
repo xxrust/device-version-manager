@@ -143,7 +143,6 @@ onMounted(loadAll);
         <input class="input" v-model="filterQuery" placeholder="搜索：序列号 / IP / 版本 / ..." style="min-width: 280px" />
         <button class="btn" @click="loadAll" :disabled="loading">刷新</button>
         <button class="btn primary" @click="pollAll">轮询全部</button>
-        <a class="btn" href="/legacy">旧版</a>
         <button class="btn" @click="logout">退出</button>
       </div>
     </div>
