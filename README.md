@@ -35,6 +35,17 @@
 
 ## 运行
 
+### 0) （可选）构建 Vue3 前端
+
+默认情况下，服务会在检测到 `web/dist` 存在时把它作为前端（`/`），旧版纯 HTML Dashboard 保留在 `/legacy`。
+
+```powershell
+cd version_manage
+cd web
+npm install
+npm run build
+```
+
 1) 初始化并启动服务：
 
 ```powershell
@@ -44,10 +55,41 @@ python -m src.version_manager.server --host 0.0.0.0 --port 8080 --db .\data\vm.s
 
 2) 打开：
 
-- Dashboard：`http://localhost:8080/`
+- Dashboard（Vue3，如果已构建）：`http://localhost:8080/`
+- Dashboard（旧版 HTML）：`http://localhost:8080/legacy`
 - API：`http://localhost:8080/api/v1/...`
 
 3) 首次使用：访问 `http://127.0.0.1:8080/setup` 创建管理员，然后到 `http://127.0.0.1:8080/login` 登录。
+
+### 登录排查/重置密码
+
+先确认你当前服务实际使用的数据库：访问 `GET /api/v1/info` 看 `db_path`，确保不是启动时误用了别的 `--db`。
+
+如需重置密码（会清理该用户所有 session）：
+
+```powershell
+python -m src.version_manager.reset_password --db .\data\vm.sqlite3 --username admin --password "newpass12345"
+```
+
+### （可选）AI 分析（LangGraph）
+
+安装：
+
+```powershell
+pip install -r .\\requirements-ai.txt
+```
+
+调用（管理员登录后）：
+
+```powershell
+irm -Method Post http://127.0.0.1:8080/api/v1/analyze/device -ContentType application/json -Body '{\"device_id\":1,\"provider\":\"ollama\",\"model\":\"qwen2.5:7b\",\"include_docs\":true,\"timeout_s\":120}'
+```
+
+说明：
+- `provider=ollama` 使用本地 Ollama（默认 `http://127.0.0.1:11434`，可用环境变量 `OLLAMA_HOST` 覆盖）
+- `provider=openai` 使用远端 OpenAI（需要环境变量 `OPENAI_API_KEY`，可选 `OPENAI_BASE_URL`）
+- `timeout_s` 端到端请求超时（秒）；默认 `120`，也可用环境变量 `VM_AI_TIMEOUT_S` 设置默认值
+- `max_tokens`（仅 openai）限制输出长度；默认 `1200`，也可用环境变量 `VM_AI_MAX_TOKENS` 设置默认值
 
 提示：设备不会“自动出现在列表里”，你需要用 API 注册设备，或用 Dashboard 的“自动发现”功能扫描局域网并写入。
 

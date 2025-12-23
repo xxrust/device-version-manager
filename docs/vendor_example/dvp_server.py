@@ -27,6 +27,83 @@ def _sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _read_text_or_file(value) -> bytes | None:
+    v = str(value or "").strip()
+    if not v:
+        return None
+    if v.startswith("@") and len(v) > 1:
+        try:
+            return open(v[1:], "rb").read()
+        except Exception:
+            return None
+    return v.encode("utf-8")
+
+
+def _build_main_version_info() -> dict | None:
+    info: dict = {}
+    changelog = getattr(cfg, "MAIN_CHANGELOG_MD", None)
+    if isinstance(changelog, str) and changelog.strip():
+        info["changelog_md"] = changelog
+    released_at = getattr(cfg, "MAIN_RELEASED_AT", None)
+    if isinstance(released_at, str) and released_at.strip():
+        info["released_at"] = released_at
+    checksum = getattr(cfg, "MAIN_CHECKSUM", None)
+    if isinstance(checksum, str) and checksum.strip():
+        info["checksum"] = checksum.strip()
+    return info or None
+
+
+def _build_docs_payload() -> list[dict]:
+    docs = getattr(cfg, "DOCS", None)
+    if docs is None:
+        return []
+    if not isinstance(docs, list):
+        return []
+    items: list[dict] = []
+    for spec in docs:
+        name = None
+        raw = None
+        content_type = "text/markdown"
+        encoding = "utf-8"
+        if isinstance(spec, str):
+            p = spec.strip()
+            if not p:
+                continue
+            name = os.path.basename(p)
+            raw = _read_file_bytes(p)
+        elif isinstance(spec, dict):
+            name = str(spec.get("name") or "").strip() or None
+            if not name:
+                p = str(spec.get("path") or "").strip()
+                name = os.path.basename(p) if p else None
+            pth = str(spec.get("path") or "").strip()
+            txt = spec.get("text")
+            if pth:
+                raw = _read_file_bytes(pth)
+            elif txt is not None:
+                raw = _read_text_or_file(txt)
+            ct = spec.get("content_type")
+            if isinstance(ct, str) and ct.strip():
+                content_type = ct.strip()
+            enc = spec.get("encoding")
+            if isinstance(enc, str) and enc.strip():
+                encoding = enc.strip()
+        else:
+            continue
+        if not name or raw is None:
+            continue
+        items.append(
+            {
+                "name": name,
+                "content_type": content_type,
+                "encoding": encoding,
+                "checksum": "sha256:" + _sha256_hex(raw),
+                "content_b64": base64.b64encode(raw).decode("ascii"),
+            }
+        )
+    return items
+
+
 def _send_json(handler: BaseHTTPRequestHandler, status: int, obj) -> None:
     data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
     handler.send_response(status)
@@ -123,6 +200,10 @@ class H(BaseHTTPRequestHandler):
                 "versions": {"main": str(cfg.MAIN_VERSION)},
             }
 
+            mvi = _build_main_version_info()
+            if mvi:
+                payload["main_version_info"] = mvi
+
             if getattr(cfg, "CONTROLLED_PATHS", None):
                 payload["files"] = _build_files_payload()
             else:
@@ -130,6 +211,13 @@ class H(BaseHTTPRequestHandler):
                 # so it's easier to debug whether the device supports files reporting.
                 if hasattr(cfg, "CONTROLLED_PATHS"):
                     payload["files"] = []
+
+            docs = _build_docs_payload()
+            if docs:
+                payload["docs"] = docs
+            else:
+                if hasattr(cfg, "DOCS"):
+                    payload["docs"] = []
 
             return _send_json(self, 200, payload)
 

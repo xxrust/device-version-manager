@@ -54,6 +54,8 @@
 - `versions` (object, MUST)
 - `components` (array, SHOULD)
 - `files` (array, SHOULD)：受控文件摘要（用于配置/模板等变更监控）
+- `main_version_info` (object, SHOULD)：`versions.main` 的版本更新信息（设备端与版本号一起上报；v1 扩展）
+- `docs` (array, SHOULD)：内联文档（通常 Markdown，用于未来 AI 分析；v1 扩展）
 - `build` (object, SHOULD)
 - `timestamp` (string, SHOULD)：设备端生成的 ISO-8601 时间
 
@@ -135,6 +137,7 @@
   "timestamp": "2025-12-17T08:40:10Z",
   "device": { "id": "VISION-001", "supplier": "VendorX", "device_type": "VisionStation-3", "serial": "VS3-24001" },
   "versions": { "main": "1.8.2", "firmware": "F3.2.0" },
+  "main_version_info": { "changelog_md": "## 1.8.2\\n- Fix: ...", "released_at": "2025-12-16T12:01:03Z", "checksum": "sha256:..." },
   "components": [
     { "name": "vision-algo", "version": "2.4.1", "checksum": "sha256:..." },
     { "name": "ui", "version": "1.8.2", "build": "20251217.1" }
@@ -142,6 +145,10 @@
   "files": [
     { "path": "/etc/app/config.yml", "checksum": "sha256:..." },
     { "path": "/opt/app/templates/default.json", "checksum": "sha256:..." }
+  ],
+  "docs": [
+    { "name": "files_and_params.md", "content_type": "text/markdown", "encoding": "utf-8", "checksum": "sha256:...", "content_b64": "Li4u" },
+    { "name": "device_features.md", "content_type": "text/markdown", "encoding": "utf-8", "checksum": "sha256:...", "content_b64": "Li4u" }
   ],
   "build": { "git": "8c1a2d9", "time": "2025-12-16T12:01:03Z" }
 }

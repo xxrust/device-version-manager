@@ -4,6 +4,7 @@ import argparse
 import base64
 import difflib
 import fnmatch
+import hashlib
 import json
 import os
 import time
@@ -110,6 +111,40 @@ def _send_html(handler: BaseHTTPRequestHandler, status: int, html: str) -> None:
     handler.end_headers()
     handler.wfile.write(data)
 
+
+def _guess_content_type(path: str) -> str:
+    p = path.lower()
+    if p.endswith(".html"):
+        return "text/html; charset=utf-8"
+    if p.endswith(".js"):
+        return "text/javascript; charset=utf-8"
+    if p.endswith(".css"):
+        return "text/css; charset=utf-8"
+    if p.endswith(".json"):
+        return "application/json; charset=utf-8"
+    if p.endswith(".svg"):
+        return "image/svg+xml"
+    if p.endswith(".ico"):
+        return "image/x-icon"
+    if p.endswith(".png"):
+        return "image/png"
+    if p.endswith(".jpg") or p.endswith(".jpeg"):
+        return "image/jpeg"
+    if p.endswith(".map"):
+        return "application/json; charset=utf-8"
+    return "application/octet-stream"
+
+
+def _send_bytes(handler: BaseHTTPRequestHandler, status: int, *, data: bytes, content_type: str) -> None:
+    handler.send_response(status)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Pragma", "no-cache")
+    handler.send_header("Expires", "0")
+    handler.send_header("Content-Length", str(len(data)))
+    handler.end_headers()
+    handler.wfile.write(data)
+
 def _redirect(handler: BaseHTTPRequestHandler, location: str) -> None:
     handler.send_response(302)
     handler.send_header("Location", location)
@@ -169,6 +204,83 @@ def _infer_from_dvp(payload: Dict[str, Any]) -> Dict[str, str]:
         device_type = device_obj.get("device_type")
         if isinstance(device_type, str) and device_type.strip():
             out["device_type"] = device_type.strip()
+    return out
+
+
+MAX_DEVICE_CHANGELOG_CHARS = 200_000
+MAX_DEVICE_DOC_BYTES = 200_000
+
+
+def _extract_main_version_info(payload: Optional[Dict[str, Any]]) -> Dict[str, Optional[str]]:
+    if not isinstance(payload, dict):
+        return {"changelog_md": None, "released_at": None, "checksum": None}
+    obj = payload.get("main_version_info")
+    if not isinstance(obj, dict):
+        return {"changelog_md": None, "released_at": None, "checksum": None}
+    changelog = obj.get("changelog_md")
+    released_at = obj.get("released_at")
+    checksum = obj.get("checksum")
+    cl = changelog.strip() if isinstance(changelog, str) and changelog.strip() else None
+    if cl is not None and len(cl) > MAX_DEVICE_CHANGELOG_CHARS:
+        cl = cl[:MAX_DEVICE_CHANGELOG_CHARS].rstrip() + "\n\n...(truncated)"
+    ra = released_at.strip() if isinstance(released_at, str) and released_at.strip() else None
+    cs = checksum.strip() if isinstance(checksum, str) and checksum.strip() else None
+    return {"changelog_md": cl, "released_at": ra, "checksum": cs}
+
+
+def _extract_inline_docs(payload: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    docs = payload.get("docs")
+    if not isinstance(docs, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in docs:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        name = name.strip()
+        if name in seen:
+            continue
+        content_b64 = item.get("content_b64")
+        if not isinstance(content_b64, str) or not content_b64.strip():
+            continue
+        enc = item.get("encoding")
+        encoding = enc.strip() if isinstance(enc, str) and enc.strip() else "utf-8"
+        ct = item.get("content_type")
+        content_type = ct.strip() if isinstance(ct, str) and ct.strip() else "text/markdown"
+        truncated = bool(item.get("truncated")) if "truncated" in item else False
+        checksum = item.get("checksum")
+        checksum_s = checksum.strip() if isinstance(checksum, str) and checksum.strip() else None
+        try:
+            raw = base64.b64decode(content_b64.encode("ascii"), validate=False)
+        except Exception:
+            continue
+        size_bytes = len(raw)
+        if size_bytes > MAX_DEVICE_DOC_BYTES:
+            raw = raw[:MAX_DEVICE_DOC_BYTES]
+            truncated = True
+        if checksum_s is None:
+            checksum_s = "sha256:" + hashlib.sha256(raw).hexdigest()
+        try:
+            content_text = raw.decode(encoding, errors="replace")
+        except Exception:
+            content_text = raw.decode("utf-8", errors="replace")
+        out.append(
+            {
+                "name": name,
+                "checksum": checksum_s,
+                "content_text": content_text,
+                "encoding": encoding,
+                "content_type": content_type,
+                "truncated": truncated,
+                "size_bytes": size_bytes,
+            }
+        )
+        seen.add(name)
     return out
 
 
@@ -679,13 +791,28 @@ def _dashboard_html() -> str:
           <select id="dCatalogVersion"></select>
         </div>
         <div class="field">
-          <label class="small">更新内容（Markdown）</label>
+          <label class="small">设备上报更新信息（只读）</label>
+          <pre class="mono" id="dDeviceChangelogMd" style="white-space:pre-wrap; border:1px solid var(--border); border-radius:12px; padding:10px; background: var(--surface2);"></pre>
+          <div class="small muted" id="dDeviceChangelogMeta"></div>
+        </div>
+        <div class="field">
+          <label class="small">管理器备注（Markdown，可编辑）</label>
           <textarea id="dChangelogMd" class="mono" rows="8" style="width:100%; padding:10px; border-radius:12px; border:1px solid var(--border); background: rgba(255,255,255,.95);"></textarea>
         </div>
         <div class="row">
-          <button class="btn" id="dSaveChangelog">保存更新内容</button>
+          <button class="btn" id="dSaveChangelog">保存备注</button>
           <span class="small muted" id="dChangelogOut"></span>
         </div>
+      </details>
+      <details>
+        <summary class="small">设备文档（docs）</summary>
+        <div style="height:8px;"></div>
+        <div class="field">
+          <label class="small">选择文档</label>
+          <select id="dDocSelect"></select>
+          <div class="small muted" id="dDocMeta"></div>
+        </div>
+        <pre class="mono" id="dDocContent" style="white-space:pre-wrap; border:1px solid var(--border); border-radius:12px; padding:10px; background: var(--surface2);"></pre>
       </details>
       <details>
         <summary class="small">原始返回 JSON</summary>
@@ -719,6 +846,8 @@ const esc = (s) => String(s ?? "")
  let currentDetailDeviceType = null;
  let currentVersionHistory = [];
  let currentObservedCatalog = null;
+ let currentDocsSnapshotId = null;
+ let currentDeviceDocs = [];
  let currentDetailCfrRule = null;
  let currentDetailReportedFiles = [];
  let statusItems = [];
@@ -919,10 +1048,25 @@ function setChangelogEditor(version){
   if(version){ sel.value = version; }
   const v = sel.value;
   const item = currentVersionHistory.find(x => String(x.main_version||"") === String(v||"")) || null;
-  const md = (currentObservedCatalog && String(currentObservedCatalog.main_version||"") === String(v||""))
-    ? (currentObservedCatalog.changelog_md || "")
+  const observed = (currentObservedCatalog && String(currentObservedCatalog.main_version||"") === String(v||""))
+    ? currentObservedCatalog
+    : null;
+  const deviceMd = observed
+    ? (observed.device_changelog_md || "")
+    : ((item && item.device_changelog_md) ? item.device_changelog_md : "");
+  const managerMd = observed
+    ? (observed.changelog_md || "")
     : ((item && item.changelog_md) ? item.changelog_md : "");
-  document.getElementById("dChangelogMd").value = md || "";
+  document.getElementById("dDeviceChangelogMd").textContent = deviceMd || "";
+  const metaSrc = observed || item || null;
+  const parts = [];
+  if(metaSrc){
+    if(metaSrc.device_released_at) parts.push(`released_at=${metaSrc.device_released_at}`);
+    if(metaSrc.device_checksum) parts.push(`checksum=${metaSrc.device_checksum}`);
+    if(metaSrc.device_updated_at) parts.push(`device_updated_at=${metaSrc.device_updated_at}`);
+  }
+  document.getElementById("dDeviceChangelogMeta").textContent = parts.join(" | ");
+  document.getElementById("dChangelogMd").value = managerMd || "";
 }
 
 function renderVersionHistory(items){
@@ -935,10 +1079,70 @@ function renderVersionHistory(items){
       <td class="mono">${esc(ver)}</td>
       <td class="mono">${esc(fmt(it.last_seen))}</td>
       <td class="mono">${esc(fmt(it.samples))}</td>
-      <td>${it.changelog_md ? "✅" : "—"}</td>
+      <td class="mono">${it.device_changelog_md ? "D✅" : "D·"} ${it.changelog_md ? "M✅" : "M·"}</td>
     `;
     tbody.appendChild(tr);
   }
+}
+
+function renderDeviceDocs(items){
+  const sel = document.getElementById("dDocSelect");
+  const meta = document.getElementById("dDocMeta");
+  const content = document.getElementById("dDocContent");
+  sel.innerHTML = "";
+  currentDeviceDocs = Array.isArray(items) ? items : [];
+  if(!currentDeviceDocs.length){
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "(no docs)";
+    sel.appendChild(opt);
+    meta.textContent = currentDocsSnapshotId ? `snapshot_id=${currentDocsSnapshotId} (no docs)` : "no docs";
+    content.textContent = "";
+    return;
+  }
+  for(const d of currentDeviceDocs){
+    const name = String(d.name || "");
+    const opt = document.createElement("option");
+    opt.value = name;
+    opt.textContent = name;
+    sel.appendChild(opt);
+  }
+  sel.value = String(currentDeviceDocs[0].name || "");
+  showSelectedDoc();
+}
+
+function showSelectedDoc(){
+  const sel = document.getElementById("dDocSelect");
+  const meta = document.getElementById("dDocMeta");
+  const content = document.getElementById("dDocContent");
+  const name = String(sel.value || "");
+  const d = currentDeviceDocs.find(x => String(x.name || "") === name) || null;
+  if(!d){
+    meta.textContent = currentDocsSnapshotId ? `snapshot_id=${currentDocsSnapshotId}` : "";
+    content.textContent = "";
+    return;
+  }
+  const bits = [];
+  if(currentDocsSnapshotId) bits.push(`snapshot_id=${currentDocsSnapshotId}`);
+  if(d.content_type) bits.push(`type=${d.content_type}`);
+  if(d.encoding) bits.push(`enc=${d.encoding}`);
+  if(d.size_bytes !== null && d.size_bytes !== undefined) bits.push(`bytes=${d.size_bytes}`);
+  if(d.truncated) bits.push("truncated=true");
+  if(d.checksum) bits.push(String(d.checksum));
+  meta.textContent = bits.join(" | ");
+  content.textContent = d.content_text || "";
+}
+
+async function loadDeviceDocs(deviceId){
+  currentDocsSnapshotId = null;
+  currentDeviceDocs = [];
+  document.getElementById("dDocSelect").innerHTML = "";
+  document.getElementById("dDocMeta").textContent = "";
+  document.getElementById("dDocContent").textContent = "";
+  const res = await apiFetch(`/api/v1/devices/${deviceId}/docs`);
+  const data = await res.json();
+  currentDocsSnapshotId = data.snapshot_id || null;
+  renderDeviceDocs(data.items || []);
 }
 
 async function loadDeviceVersionHistory(deviceId, observedVersion){
@@ -1252,10 +1456,17 @@ async function openDeviceDlg(id){
   document.getElementById("dCfrChgRows").innerHTML = "";
   document.getElementById("dCfrChgDiff").textContent = "";
   document.getElementById("dCfrAckOut").textContent = "";
+  document.getElementById("dDeviceChangelogMd").textContent = "";
+  document.getElementById("dDeviceChangelogMeta").textContent = "";
   document.getElementById("dChangelogMd").value = "";
   document.getElementById("dChangelogOut").textContent = "";
   document.getElementById("dHistRows").innerHTML = "";
   document.getElementById("dCatalogVersion").innerHTML = "";
+  document.getElementById("dDocSelect").innerHTML = "";
+  document.getElementById("dDocMeta").textContent = "";
+  document.getElementById("dDocContent").textContent = "";
+  currentDocsSnapshotId = null;
+  currentDeviceDocs = [];
   const dlg = document.getElementById("deviceDlg");
   dlg.showModal();
   const res = await apiFetch(`/api/v1/devices/${id}`);
@@ -1286,6 +1497,7 @@ async function openDeviceDlg(id){
   renderControlledFiles(data.controlled_file_rule || null, raw);
   await loadLastControlledFileChangeEvent(id);
   await loadDeviceVersionHistory(id, snap ? (snap.main_version || "") : "");
+  await loadDeviceDocs(id);
 }
 
 async function saveChangelog(){
@@ -1553,6 +1765,7 @@ document.getElementById("closeDeviceDlg").addEventListener("click", () => docume
 document.getElementById("deviceCancel").addEventListener("click", () => document.getElementById("deviceDlg").close());
 document.getElementById("deviceSave").addEventListener("click", saveDeviceDetail);
 document.getElementById("dCatalogVersion").addEventListener("change", () => setChangelogEditor());
+document.getElementById("dDocSelect").addEventListener("change", () => showSelectedDoc());
 document.getElementById("dSaveChangelog").addEventListener("click", saveChangelog);
 document.getElementById("dCfrSelAll").addEventListener("click", () => _setCfrAll(true));
 document.getElementById("dCfrSelNone").addEventListener("click", () => _setCfrAll(false));
@@ -1755,6 +1968,7 @@ class App:
         poll_interval_s: float = 0.0,
         webhook_url: Optional[str] = None,
         api_token: Optional[str] = None,
+        frontend_dist: Optional[str] = None,
     ):
         self.db = db
         self.poll_workers = poll_workers
@@ -1763,6 +1977,9 @@ class App:
         self.poll_interval_s = float(poll_interval_s)
         self.webhook_url = webhook_url
         self.api_token = api_token
+        self.frontend_dist = os.path.abspath(frontend_dist) if frontend_dist else None
+        if self.frontend_dist and not os.path.isdir(self.frontend_dist):
+            self.frontend_dist = None
         self._stop_event = threading.Event()
         self._scheduler_thread: Optional[threading.Thread] = None
 
@@ -2172,6 +2389,35 @@ class App:
                 )
             except Exception:
                 pass
+            try:
+                info = _extract_main_version_info(res.payload if isinstance(res.payload, dict) else None)
+                self.db.upsert_device_version_info(
+                    vendor=str(device.get("vendor") or "").strip(),
+                    model=str(device.get("model") or "").strip(),
+                    main_version=str(res.main_version),
+                    device_changelog_md=info.get("changelog_md"),
+                    device_released_at=info.get("released_at"),
+                    device_checksum=info.get("checksum"),
+                )
+            except Exception:
+                pass
+
+            try:
+                docs = _extract_inline_docs(res.payload if isinstance(res.payload, dict) else None)
+                for d in docs:
+                    self.db.upsert_device_doc(
+                        device_id=device_id,
+                        snapshot_id=snapshot_id,
+                        name=str(d.get("name") or ""),
+                        checksum=d.get("checksum"),
+                        content_text=d.get("content_text"),
+                        encoding=d.get("encoding"),
+                        content_type=d.get("content_type"),
+                        truncated=bool(d.get("truncated")),
+                        size_bytes=d.get("size_bytes"),
+                    )
+            except Exception:
+                pass
         controlled_changes: List[Dict[str, Any]] = []
         try:
             controlled_changes = self._check_controlled_files(
@@ -2350,6 +2596,35 @@ class VersionManagerHandler(BaseHTTPRequestHandler):
     def app(self) -> App:
         return getattr(self.server, "app")  # type: ignore[attr-defined]
 
+    def _try_serve_frontend(self, url_path: str) -> bool:
+        dist = getattr(self.app, "frontend_dist", None)
+        if not dist:
+            return False
+        dist_abs = os.path.abspath(dist)
+        req = (url_path or "/").split("?", 1)[0].split("#", 1)[0]
+        rel = req.lstrip("/") or "index.html"
+        # Prevent path traversal.
+        candidate = os.path.abspath(os.path.join(dist_abs, rel))
+        if not (candidate == dist_abs or candidate.startswith(dist_abs + os.sep)):
+            return False
+        if os.path.isfile(candidate):
+            try:
+                data = open(candidate, "rb").read()
+            except Exception:
+                return False
+            _send_bytes(self, 200, data=data, content_type=_guess_content_type(candidate))
+            return True
+        # SPA fallback
+        index = os.path.join(dist_abs, "index.html")
+        if os.path.isfile(index):
+            try:
+                data = open(index, "rb").read()
+            except Exception:
+                return False
+            _send_bytes(self, 200, data=data, content_type=_guess_content_type(index))
+            return True
+        return False
+
     def _auth(self) -> Optional[Dict[str, Any]]:
         # API token bypass (admin)
         if self.app.api_token:
@@ -2409,10 +2684,24 @@ class VersionManagerHandler(BaseHTTPRequestHandler):
                 return _send_json(self, 404, {"error": "not_found"})
             return _send_html(self, 200, _setup_html())
 
-        if parsed.path == "/":
+        if parsed.path == "/legacy":
             if not self._auth():
                 return _redirect(self, "/login")
             return _send_html(self, 200, _dashboard_html())
+
+        if parsed.path == "/":
+            if not self._auth():
+                return _redirect(self, "/login")
+            if self._try_serve_frontend(parsed.path):
+                return
+            return _send_html(self, 200, _dashboard_html())
+
+        # Serve Vue frontend static assets / SPA routes (when built dist exists).
+        if not parsed.path.startswith("/api/") and self.app.frontend_dist:
+            if not self._auth():
+                return _redirect(self, "/login")
+            if self._try_serve_frontend(parsed.path):
+                return
 
         if parts[:3] == ["api", "v1", "clusters"] and len(parts) == 3:
             if not self._require_login():
@@ -2468,6 +2757,30 @@ class VersionManagerHandler(BaseHTTPRequestHandler):
                 lim = 200
             items = self.app.db.list_device_version_history(device_id=device_id, limit=lim)
             return _send_json(self, 200, {"items": items})
+
+        if parts[:3] == ["api", "v1", "devices"] and len(parts) == 5 and parts[4] == "docs":
+            if not self._require_login():
+                return
+            try:
+                device_id = int(parts[3])
+            except ValueError:
+                return _send_json(self, 400, {"error": "invalid_device_id"})
+            if not self.app.db.get_device(device_id):
+                return _send_json(self, 404, {"error": "not_found"})
+            snapshot_id = qs.get("snapshot_id", [None])[0]
+            snap_id = None
+            if snapshot_id:
+                try:
+                    snap_id = int(snapshot_id)
+                except Exception:
+                    return _send_json(self, 400, {"error": "invalid_snapshot_id"})
+            if snap_id is None:
+                snap = self.app.db.get_latest_success_snapshot(device_id)
+                snap_id = int(snap["id"]) if snap and snap.get("id") is not None else None
+            if snap_id is None:
+                return _send_json(self, 200, {"snapshot_id": None, "items": []})
+            items = self.app.db.list_device_docs(device_id=device_id, snapshot_id=snap_id)
+            return _send_json(self, 200, {"snapshot_id": snap_id, "items": items})
 
         if parts[:3] == ["api", "v1", "devices"] and len(parts) == 4:
             if not self._require_login():
@@ -2638,6 +2951,91 @@ class VersionManagerHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
             return
+
+        if parts[:3] == ["api", "v1", "analyze"] and len(parts) == 4 and parts[3] == "device":
+            if not self._require_admin():
+                return
+            try:
+                body = _read_json(self)
+            except ValueError as e:
+                return _send_json(self, 400, {"error": str(e)})
+            try:
+                device_id = int(body.get("device_id"))
+            except Exception:
+                return _send_json(self, 400, {"error": "missing_or_invalid_device_id"})
+            provider = str(body.get("provider") or "ollama").strip()
+            model = str(body.get("model") or "").strip()
+            if not model:
+                model = "qwen2.5:7b" if provider.lower() in ("ollama", "local") else "gpt-4o-mini"
+            include_docs = bool(body.get("include_docs", True))
+
+            timeout_raw = body.get("timeout_s")
+            if timeout_raw is None:
+                timeout_raw = str(os.environ.get("VM_AI_TIMEOUT_S", "")).strip() or None
+            try:
+                timeout_s = float(timeout_raw) if timeout_raw is not None else 120.0
+            except Exception:
+                timeout_s = 120.0
+            timeout_s = max(5.0, min(timeout_s, 600.0))
+
+            max_tokens_raw = body.get("max_tokens")
+            if max_tokens_raw is None:
+                max_tokens_raw = str(os.environ.get("VM_AI_MAX_TOKENS", "")).strip() or None
+            try:
+                max_tokens = int(max_tokens_raw) if max_tokens_raw is not None else 1200
+            except Exception:
+                max_tokens = 1200
+            max_tokens = max(256, min(max_tokens, 8192))
+
+            dev = self.app.db.get_device(device_id)
+            if not dev:
+                return _send_json(self, 404, {"error": "device_not_found"})
+            snap = self.app.db.get_latest_snapshot(device_id)
+            base = self.app.db.get_baseline(
+                cluster_id=int(dev["cluster_id"]), vendor=str(dev["vendor"]), model=str(dev["model"])
+            )
+            vendor = str(dev.get("vendor") or "").strip()
+            model_key = str(dev.get("model") or "").strip()
+            observed_catalog = None
+            if snap and snap.get("main_version"):
+                observed_catalog = self.app.db.get_version_catalog_item(
+                    vendor=vendor, model=model_key, main_version=str(snap.get("main_version") or "")
+                )
+            events = self.app.db.list_events(limit=50, device_id=device_id)
+            docs = []
+            docs_snapshot_id = None
+            if include_docs:
+                success_snap = self.app.db.get_latest_success_snapshot(device_id)
+                if success_snap and success_snap.get("id") is not None:
+                    docs_snapshot_id = int(success_snap["id"])
+                    docs = self.app.db.list_device_docs(device_id=device_id, snapshot_id=docs_snapshot_id)
+
+            context = {
+                "device": _present_device(dict(dev)),
+                "baseline": _present_baseline(dict(base)) if base else None,
+                "latest_snapshot": snap,
+                "observed_version_catalog": _present_version_catalog_item(observed_catalog) if observed_catalog else None,
+                "events": events,
+                "docs_snapshot_id": docs_snapshot_id,
+                "docs": docs,
+            }
+            try:
+                from .ai import AiNotAvailable, ModelError, analyze_version_state  # type: ignore
+
+                result = analyze_version_state(
+                    context=context,
+                    provider=provider,
+                    model=model,
+                    timeout_s=timeout_s,
+                    max_tokens=max_tokens,
+                )
+            except AiNotAvailable as e:
+                return _send_json(self, 503, {"error": str(e)})
+            except ModelError as e:
+                return _send_json(self, 502, {"error": str(e)})
+            except Exception as e:  # noqa: BLE001
+                return _send_json(self, 500, {"error": f"analysis_failed:{type(e).__name__}:{e}"})
+            return _send_json(self, 200, {"ok": True, "provider": provider, "model": model, "result": result})
 
         if parts[:3] == ["api", "v1", "register"] and len(parts) == 3:
             try:
@@ -3267,6 +3665,7 @@ def serve(
     poll_interval_s: float = 0.0,
     webhook_url: Optional[str] = None,
     api_token: Optional[str] = None,
+    frontend_dist: Optional[str] = None,
 ) -> None:
     db = Database(db_path)
     if default_cluster_name and default_cluster_id is None:
@@ -3285,6 +3684,7 @@ def serve(
         poll_interval_s=poll_interval_s,
         webhook_url=webhook_url,
         api_token=api_token,
+        frontend_dist=frontend_dist,
     )
     httpd = ThreadingHTTPServer((host, port), VersionManagerHandler)
     httpd.app = app  # type: ignore[attr-defined]
@@ -3298,10 +3698,11 @@ def serve(
                 "registration_token_enabled": bool(registration_token),
                 "default_cluster_id": default_cluster_id,
                 "poll_interval_s": poll_interval_s,
-                "webhook_url": webhook_url,
-                "api_token_enabled": bool(api_token),
-                "timestamp": _utc_now_iso(),
-            },
+                    "webhook_url": webhook_url,
+                    "api_token_enabled": bool(api_token),
+                    "frontend_dist": os.path.abspath(frontend_dist) if frontend_dist else None,
+                    "timestamp": _utc_now_iso(),
+                },
             ensure_ascii=False,
         )
     )
@@ -3334,6 +3735,7 @@ def main() -> None:
     p.add_argument("--poll-interval", default=0, type=float, help="Auto poll interval seconds (0 disables)")
     p.add_argument("--webhook-url", default=None, help="POST events to webhook URL (optional)")
     p.add_argument("--api-token", default=None, help="Optional admin API token via X-Api-Token header")
+    p.add_argument("--frontend-dist", default=os.path.join("web", "dist"), help="Optional built frontend dist directory")
     args = p.parse_args()
     serve(
         host=args.host,
@@ -3346,6 +3748,7 @@ def main() -> None:
         poll_interval_s=args.poll_interval,
         webhook_url=args.webhook_url,
         api_token=args.api_token,
+        frontend_dist=args.frontend_dist,
     )
 
 

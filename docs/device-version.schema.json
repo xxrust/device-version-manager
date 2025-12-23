@@ -68,6 +68,33 @@
         "image": { "type": "string" }
       },
       "additionalProperties": true
+    },
+    "main_version_info": {
+      "type": "object",
+      "description": "Optional metadata for versions.main, reported by device (DVP v1 extension).",
+      "properties": {
+        "changelog_md": { "type": "string" },
+        "released_at": { "type": "string" },
+        "checksum": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "docs": {
+      "type": "array",
+      "description": "Optional inline documentation blobs (typically Markdown) for future analysis (DVP v1 extension).",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "checksum": { "type": "string" },
+          "encoding": { "type": "string" },
+          "content_type": { "type": "string" },
+          "content_b64": { "type": "string" },
+          "truncated": { "type": "boolean" }
+        },
+        "additionalProperties": true
+      }
     }
   },
   "additionalProperties": true

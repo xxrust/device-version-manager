@@ -91,18 +91,25 @@ class MockDeviceHandler(BaseHTTPRequestHandler):
             "timestamp": _utc_now_iso(),
             "device": {
                 "id": self.cfg["device_id"],
-                "vendor": self.cfg["vendor"],
-                "model": self.cfg["model"],
+                "supplier": self.cfg["supplier"],
+                "device_type": self.cfg["device_type"],
                 "serial": self.cfg.get("serial") or self.cfg["device_id"],
             },
             "versions": {"main": self.cfg["main_version"]},
         }
+        mvi = self.cfg.get("main_version_info") or None
+        if isinstance(mvi, dict):
+            clean = {k: v for k, v in mvi.items() if v is not None and str(v).strip() != ""}
+            if clean:
+                payload["main_version_info"] = clean
         if self.cfg.get("firmware"):
             payload["versions"]["firmware"] = self.cfg["firmware"]
         if self.cfg.get("components"):
             payload["components"] = self.cfg["components"]
         if self.cfg.get("files"):
             payload["files"] = self.cfg["files"]
+        if self.cfg.get("docs"):
+            payload["docs"] = self.cfg["docs"]
 
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(200)
@@ -120,6 +127,9 @@ def main() -> None:
     p.add_argument("--vendor", default="VendorX")
     p.add_argument("--model", default="MockModel")
     p.add_argument("--version", dest="main_version", default="1.0.0")
+    p.add_argument("--main-changelog", dest="main_changelog", default=None, help="Main version changelog markdown: <text> or @<localfile>")
+    p.add_argument("--main-released-at", dest="main_released_at", default=None, help="Main version released_at (ISO-8601 or any string)")
+    p.add_argument("--main-checksum", dest="main_checksum", default=None, help="Main version checksum, e.g. sha256:<hex>")
     p.add_argument("--firmware", default=None)
     p.add_argument("--token", default=None, help="Optional token (accepts Bearer or X-Device-Token)")
     p.add_argument(
@@ -140,6 +150,13 @@ def main() -> None:
         "--inline-file-content",
         action="store_true",
         help="Include content_b64 in the main /.well-known/device-version response (default: only expose via /file endpoint).",
+    )
+    p.add_argument(
+        "--doc",
+        dest="docs",
+        action="append",
+        default=[],
+        help="Inline documentation (markdown): <name>=<text> or <name>=@<localfile>",
     )
     args = p.parse_args()
 
@@ -214,16 +231,54 @@ def main() -> None:
             item["content_type"] = meta.get("content_type")
             item["content_b64"] = meta.get("content_b64")
 
+    def read_text_or_file(value: str) -> bytes:
+        v = str(value or "")
+        if v.startswith("@") and len(v) > 1:
+            try:
+                return open(v[1:], "rb").read()
+            except Exception:
+                return v.encode("utf-8")
+        return v.encode("utf-8")
+
+    docs = []
+    for spec in args.docs or []:
+        s = str(spec or "").strip()
+        if not s:
+            continue
+        if "=" not in s:
+            continue
+        name, value = s.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if not name:
+            continue
+        raw = read_text_or_file(value)
+        docs.append(
+            {
+                "name": name,
+                "content_type": "text/markdown",
+                "encoding": "utf-8",
+                "checksum": "sha256:" + hashlib.sha256(raw).hexdigest(),
+                "content_b64": base64.b64encode(raw).decode("ascii"),
+            }
+        )
+
     httpd = ThreadingHTTPServer((args.host, args.port), MockDeviceHandler)
     httpd.cfg = {  # type: ignore[attr-defined]
         "device_id": args.device_id,
-        "vendor": args.vendor,
-        "model": args.model,
+        "supplier": args.vendor,
+        "device_type": args.model,
         "main_version": args.main_version,
+        "main_version_info": {
+            "changelog_md": (read_text_or_file(args.main_changelog).decode("utf-8", errors="replace") if args.main_changelog else None),
+            "released_at": args.main_released_at,
+            "checksum": args.main_checksum,
+        },
         "firmware": args.firmware,
         "token": args.token,
         "files": files,
         "file_contents": file_contents,
+        "docs": docs,
     }
     httpd.serve_forever()
 

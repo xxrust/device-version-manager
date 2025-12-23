@@ -133,6 +133,10 @@ class Database:
                     vendor TEXT NOT NULL,
                     model TEXT NOT NULL,
                     main_version TEXT NOT NULL,
+                    device_changelog_md TEXT,
+                    device_released_at TEXT,
+                    device_checksum TEXT,
+                    device_updated_at TEXT,
                     changelog_md TEXT,
                     released_at TEXT,
                     risk_level TEXT,
@@ -159,6 +163,25 @@ class Database:
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_device_snapshots_device_time ON device_snapshots(device_id, observed_at DESC);
+
+                CREATE TABLE IF NOT EXISTS device_docs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    device_id INTEGER NOT NULL,
+                    snapshot_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    checksum TEXT,
+                    content_text TEXT,
+                    encoding TEXT,
+                    content_type TEXT,
+                    truncated INTEGER NOT NULL,
+                    size_bytes INTEGER,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(device_id, snapshot_id, name),
+                    FOREIGN KEY(device_id) REFERENCES devices(id) ON DELETE CASCADE,
+                    FOREIGN KEY(snapshot_id) REFERENCES device_snapshots(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_device_docs_lookup ON device_docs(device_id, snapshot_id, name);
 
                 CREATE TABLE IF NOT EXISTS events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -216,6 +239,14 @@ class Database:
             self._conn.execute("ALTER TABLE controlled_file_rules ADD COLUMN mode TEXT;")
         if not has_column("controlled_file_rules", "max_bytes"):
             self._conn.execute("ALTER TABLE controlled_file_rules ADD COLUMN max_bytes INTEGER;")
+        if not has_column("version_catalog", "device_changelog_md"):
+            self._conn.execute("ALTER TABLE version_catalog ADD COLUMN device_changelog_md TEXT;")
+        if not has_column("version_catalog", "device_released_at"):
+            self._conn.execute("ALTER TABLE version_catalog ADD COLUMN device_released_at TEXT;")
+        if not has_column("version_catalog", "device_checksum"):
+            self._conn.execute("ALTER TABLE version_catalog ADD COLUMN device_checksum TEXT;")
+        if not has_column("version_catalog", "device_updated_at"):
+            self._conn.execute("ALTER TABLE version_catalog ADD COLUMN device_updated_at TEXT;")
 
     def has_any_user(self) -> bool:
         rows = self._query("SELECT 1 AS x FROM users LIMIT 1")
@@ -264,6 +295,31 @@ class Database:
         if not secrets.compare_digest(got, expected):
             return None
         return {"id": int(u["id"]), "username": u["username"], "role": u["role"]}
+
+    def update_user_password(self, *, username: str, new_password: str) -> bool:
+        username = str(username).strip()
+        if not username:
+            raise ValueError("missing_username")
+        if not new_password or len(str(new_password)) < 8:
+            raise ValueError("password_too_short")
+        rows = self._query("SELECT id FROM users WHERE username = ? LIMIT 1", (username,))
+        if not rows:
+            return False
+        user_id = int(rows[0]["id"])
+        salt = secrets.token_bytes(16)
+        pwd_hash = self._hash_password(str(new_password), salt=salt)
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE users SET password_salt_b64 = ?, password_hash_b64 = ? WHERE id = ?",
+                (
+                    base64.b64encode(salt).decode("ascii"),
+                    base64.b64encode(pwd_hash).decode("ascii"),
+                    user_id,
+                ),
+            )
+            # invalidate sessions for this user
+            self._conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+        return True
 
     def create_session(self, *, user_id: int, ttl_seconds: int = 12 * 3600) -> str:
         token = secrets.token_urlsafe(32)
@@ -804,6 +860,46 @@ class Database:
             )
             return int(cur.lastrowid) if cur.lastrowid else 0
 
+    def upsert_device_version_info(
+        self,
+        *,
+        vendor: str,
+        model: str,
+        main_version: str,
+        device_changelog_md: Optional[str] = None,
+        device_released_at: Optional[str] = None,
+        device_checksum: Optional[str] = None,
+    ) -> int:
+        if device_changelog_md is None and device_released_at is None and device_checksum is None:
+            return 0
+        now = _utc_now_iso()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                """
+                INSERT INTO version_catalog(
+                    vendor, model, main_version,
+                    device_changelog_md, device_released_at, device_checksum, device_updated_at,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(vendor, model, main_version) DO UPDATE SET
+                    device_changelog_md = excluded.device_changelog_md,
+                    device_released_at = excluded.device_released_at,
+                    device_checksum = excluded.device_checksum,
+                    device_updated_at = excluded.device_updated_at
+                """,
+                (
+                    vendor,
+                    model,
+                    main_version,
+                    device_changelog_md,
+                    device_released_at,
+                    device_checksum,
+                    now,
+                    now,
+                ),
+            )
+            return int(cur.lastrowid) if cur.lastrowid else 0
+
     def ensure_version_catalog_entry(self, *, vendor: str, model: str, main_version: str) -> None:
         now = _utc_now_iso()
         with self._lock, self._conn:
@@ -819,7 +915,10 @@ class Database:
     def get_version_catalog_item(self, *, vendor: str, model: str, main_version: str) -> Optional[Dict[str, Any]]:
         rows = self._query(
             """
-            SELECT id, vendor, model, main_version, changelog_md, released_at, risk_level, checksum, created_at
+            SELECT
+                id, vendor, model, main_version,
+                device_changelog_md, device_released_at, device_checksum, device_updated_at,
+                changelog_md, released_at, risk_level, checksum, created_at
             FROM version_catalog
             WHERE vendor = ? AND model = ? AND main_version = ?
             LIMIT 1
@@ -840,7 +939,10 @@ class Database:
         where_sql = f"WHERE {' AND '.join(wheres)}" if wheres else ""
         rows = self._query(
             f"""
-            SELECT id, vendor, model, main_version, changelog_md, released_at, risk_level, checksum, created_at
+            SELECT
+                id, vendor, model, main_version,
+                device_changelog_md, device_released_at, device_checksum, device_updated_at,
+                changelog_md, released_at, risk_level, checksum, created_at
             FROM version_catalog
             {where_sql}
             ORDER BY vendor ASC, model ASC, main_version ASC
@@ -848,6 +950,76 @@ class Database:
             tuple(params),
         )
         return [dict(r) for r in rows]
+
+    def upsert_device_doc(
+        self,
+        *,
+        device_id: int,
+        snapshot_id: int,
+        name: str,
+        checksum: Optional[str],
+        content_text: Optional[str],
+        encoding: Optional[str],
+        content_type: Optional[str],
+        truncated: bool,
+        size_bytes: Optional[int],
+    ) -> int:
+        now = _utc_now_iso()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                """
+                INSERT INTO device_docs(
+                    device_id, snapshot_id, name,
+                    checksum, content_text, encoding, content_type,
+                    truncated, size_bytes, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(device_id, snapshot_id, name) DO UPDATE SET
+                    checksum = excluded.checksum,
+                    content_text = excluded.content_text,
+                    encoding = excluded.encoding,
+                    content_type = excluded.content_type,
+                    truncated = excluded.truncated,
+                    size_bytes = excluded.size_bytes
+                """,
+                (
+                    int(device_id),
+                    int(snapshot_id),
+                    str(name),
+                    checksum,
+                    content_text,
+                    encoding,
+                    content_type,
+                    1 if truncated else 0,
+                    int(size_bytes) if size_bytes is not None else None,
+                    now,
+                ),
+            )
+            return int(cur.lastrowid) if cur.lastrowid else 0
+
+    def list_device_docs(self, *, device_id: int, snapshot_id: int) -> List[Dict[str, Any]]:
+        rows = self._query(
+            """
+            SELECT
+                id, device_id, snapshot_id, name,
+                checksum, content_text, encoding, content_type,
+                truncated, size_bytes, created_at
+            FROM device_docs
+            WHERE device_id = ? AND snapshot_id = ?
+            ORDER BY name ASC, id ASC
+            """,
+            (int(device_id), int(snapshot_id)),
+        )
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            d["truncated"] = bool(d.get("truncated"))
+            if d.get("size_bytes") is not None:
+                try:
+                    d["size_bytes"] = int(d["size_bytes"])
+                except Exception:
+                    pass
+            out.append(d)
+        return out
 
     def record_snapshot(
         self,
@@ -974,6 +1146,9 @@ class Database:
                 MIN(s.observed_at) AS first_seen,
                 MAX(s.observed_at) AS last_seen,
                 COUNT(*) AS samples,
+                vc.device_changelog_md AS device_changelog_md,
+                vc.device_released_at AS device_released_at,
+                vc.device_checksum AS device_checksum,
                 vc.changelog_md AS changelog_md,
                 vc.released_at AS released_at,
                 vc.risk_level AS risk_level,
